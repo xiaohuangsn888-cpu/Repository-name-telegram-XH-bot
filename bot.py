@@ -17,7 +17,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# CẤU HÌNH GHI LOG
+# GHI NHẬT KÝ
 # =========================================================
 
 logging.basicConfig(
@@ -29,27 +29,30 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# BIẾN MÔI TRƯỜNG TRÊN RENDER
+# CẤU HÌNH RENDER
 # =========================================================
 
+# Token được nhập trong Environment Variables của Render.
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Render tự tạo PORT cho Web Service
+# Render tự cấp cổng cho Web Service.
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Render tự tạo địa chỉ dạng:
-# https://ten-dich-vu.onrender.com
-RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL")
+# Render tự cấp hostname dạng:
+# ten-dich-vu.onrender.com
+RENDER_EXTERNAL_HOSTNAME = os.environ.get(
+    "RENDER_EXTERNAL_HOSTNAME"
+)
 
-# Đường dẫn Telegram gửi dữ liệu về
+# Telegram sẽ gửi cập nhật vào đường dẫn này.
 WEBHOOK_PATH = "telegram-webhook"
 
-# Múi giờ Philippines
+# Giờ Philippines.
 TIME_ZONE = ZoneInfo("Asia/Manila")
 
 
 # =========================================================
-# DANH SÁCH HÀNH ĐỘNG
+# TÊN CÁC HÀNH ĐỘNG
 # =========================================================
 
 ACTIONS = {
@@ -61,7 +64,7 @@ ACTIONS = {
 
 
 # =========================================================
-# TẠO MENU NÚT
+# TẠO CÁC NÚT
 # =========================================================
 
 def create_menu() -> InlineKeyboardMarkup:
@@ -101,7 +104,7 @@ async def show_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Hiển thị menu khi người dùng gửi /start hoặc /menu."""
+    """Hiển thị các nút."""
 
     message = update.effective_message
 
@@ -109,13 +112,7 @@ async def show_menu(
         return
 
     await message.reply_text(
-        text=(
-            "📌 Vui lòng chọn thao tác bên dưới:\n\n"
-            "🍚 Đi ăn\n"
-            "🚻 Đi WC\n"
-            "↩️ Quay lại\n"
-            "📋 Kiểm tra"
-        ),
+        text="📌 Vui lòng chọn thao tác:",
         reply_markup=create_menu(),
     )
 
@@ -128,10 +125,7 @@ async def show_chat_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """
-    Hiển thị Group ID.
-    Sau này dùng ID này để phân biệt nhóm nào ghi vào bảng nào.
-    """
+    """Hiển thị ID nhóm Telegram."""
 
     message = update.effective_message
     chat = update.effective_chat
@@ -150,27 +144,27 @@ async def show_chat_id(
 
 
 # =========================================================
-# XỬ LÝ KHI NGƯỜI DÙNG NHẤN NÚT
+# XỬ LÝ NÚT
 # =========================================================
 
 async def handle_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Xử lý thao tác nhấn nút."""
+    """Xử lý khi thành viên nhấn nút."""
 
     query = update.callback_query
 
     if query is None:
         return
 
-    # Dừng biểu tượng tải trên nút
+    # Dừng biểu tượng tải trên nút Telegram.
     await query.answer()
 
     user = query.from_user
     chat = update.effective_chat
 
-    action_code = query.data
+    action_code = query.data or ""
     action_name = ACTIONS.get(
         action_code,
         "⚠️ Thao tác không xác định",
@@ -193,7 +187,6 @@ async def handle_button(
         group_name = "Không xác định"
         group_id = "Không xác định"
 
-    # Nút kiểm tra
     if action_code == "check":
         result = (
             "📋 THÔNG TIN KIỂM TRA\n\n"
@@ -202,7 +195,7 @@ async def handle_button(
             f"👥 Nhóm: {group_name}\n"
             f"🆔 Group ID: {group_id}\n"
             f"🕐 Thời gian: {current_time}\n\n"
-            "ℹ️ Chức năng kiểm tra dữ liệu Google Sheets "
+            "ℹ️ Chức năng đọc Google Sheets "
             "sẽ được kết nối ở bước tiếp theo."
         )
     else:
@@ -224,11 +217,11 @@ async def handle_button(
 
 
 # =========================================================
-# CÀI ĐẶT DANH SÁCH LỆNH TELEGRAM
+# CÀI DANH SÁCH LỆNH
 # =========================================================
 
 async def post_init(application: Application) -> None:
-    """Cài danh sách lệnh hiển thị trong menu Telegram."""
+    """Hiển thị các lệnh trong menu của Telegram."""
 
     commands = [
         BotCommand(
@@ -247,7 +240,7 @@ async def post_init(application: Application) -> None:
 
     await application.bot.set_my_commands(commands)
 
-    logger.info("Đã cài đặt danh sách lệnh Telegram.")
+    logger.info("Đã cài danh sách lệnh Telegram.")
 
 
 # =========================================================
@@ -258,7 +251,7 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Ghi lỗi để kiểm tra trong Render Logs."""
+    """Hiển thị lỗi trong Render Logs."""
 
     logger.exception(
         "Bot gặp lỗi khi xử lý dữ liệu.",
@@ -271,24 +264,22 @@ async def error_handler(
 # =========================================================
 
 def main() -> None:
-    """Khởi động bot bằng webhook trên Render."""
+    """Khởi động bot bằng webhook."""
 
     if not BOT_TOKEN:
         raise RuntimeError(
             "Không tìm thấy BOT_TOKEN. "
-            "Hãy thêm BOT_TOKEN trong Environment Variables của Render."
+            "Hãy thêm BOT_TOKEN trong Render Environment."
         )
 
-    if not RENDER_EXTERNAL_URL:
+    if not RENDER_EXTERNAL_HOSTNAME:
         raise RuntimeError(
-            "Không tìm thấy RENDER_EXTERNAL_URL. "
-            "Bot phải được tạo dưới dạng Render Web Service."
+            "Không tìm thấy RENDER_EXTERNAL_HOSTNAME. "
+            "Hãy triển khai dưới dạng Render Web Service."
         )
-
-    external_url = RENDER_EXTERNAL_URL.rstrip("/")
 
     webhook_url = (
-        f"{external_url}/{WEBHOOK_PATH}"
+        f"https://{RENDER_EXTERNAL_HOSTNAME}/{WEBHOOK_PATH}"
     )
 
     application = (
@@ -300,35 +291,35 @@ def main() -> None:
 
     application.add_handler(
         CommandHandler(
-            command="start",
-            callback=show_menu,
+            "start",
+            show_menu,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            command="menu",
-            callback=show_menu,
+            "menu",
+            show_menu,
         )
     )
 
     application.add_handler(
         CommandHandler(
-            command="id",
-            callback=show_chat_id,
+            "id",
+            show_chat_id,
         )
     )
 
     application.add_handler(
         CallbackQueryHandler(
-            callback=handle_button,
+            handle_button,
         )
     )
 
     application.add_error_handler(error_handler)
 
-    logger.info("Bot đang khởi động...")
-    logger.info("Webhook URL: %s", webhook_url)
+    logger.info("Bot đang khởi động.")
+    logger.info("Webhook: %s", webhook_url)
     logger.info("Port: %s", PORT)
 
     application.run_webhook(
