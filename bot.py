@@ -1,8 +1,11 @@
+import asyncio
 import logging
 import os
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import gspread
+from google.oauth2.service_account import Credentials
 from telegram import (
     BotCommand,
     KeyboardButton,
@@ -18,7 +21,7 @@ from telegram.ext import (
 )
 
 # =========================================================
-# CẤU HÌNH LOG
+# LOG
 # =========================================================
 
 logging.basicConfig(
@@ -30,14 +33,11 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# CẤU HÌNH RENDER
+# RENDER VÀ TELEGRAM
 # =========================================================
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
-PORT = int(
-    os.environ.get("PORT", "10000")
-)
+PORT = int(os.environ.get("PORT", "10000"))
 
 RENDER_EXTERNAL_HOSTNAME = os.environ.get(
     "RENDER_EXTERNAL_HOSTNAME"
@@ -50,7 +50,59 @@ TIME_ZONE = ZoneInfo("Asia/Manila")
 
 
 # =========================================================
-# TÊN CÁC NÚT
+# GOOGLE SHEETS
+# =========================================================
+
+GOOGLE_CREDENTIALS_FILE = (
+    "/etc/secrets/google-credentials.json"
+)
+
+SPREADSHEET_ID = (
+    "1Z05WB8AOts_pjDC7D7bg28qKd6hEbeRG23AvP0RMFaI"
+)
+
+WORKSHEET_NAME = "Trang tính1"
+
+# Chỉ nhóm này được ghi vào bảng
+ALLOWED_GROUP_ID = -1004440715006
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
+def create_worksheet():
+    """Kết nối Google Sheets và trả về trang cần ghi."""
+
+    if not os.path.exists(GOOGLE_CREDENTIALS_FILE):
+        raise FileNotFoundError(
+            "Không tìm thấy file google-credentials.json "
+            "trong Render Secret Files."
+        )
+
+    credentials = Credentials.from_service_account_file(
+        GOOGLE_CREDENTIALS_FILE,
+        scopes=SCOPES,
+    )
+
+    client = gspread.authorize(credentials)
+
+    spreadsheet = client.open_by_key(
+        SPREADSHEET_ID
+    )
+
+    return spreadsheet.worksheet(
+        WORKSHEET_NAME
+    )
+
+
+# Kết nối một lần khi bot khởi động
+worksheet = None
+
+
+# =========================================================
+# NÚT
 # =========================================================
 
 BUTTON_CHECKIN = "上班/checkin"
@@ -61,24 +113,7 @@ BUTTON_BACK = "回/back"
 BUTTON_CHECK = "检查/check"
 
 
-# =========================================================
-# TẠO BÀN PHÍM GIỐNG ẢNH MẪU
-# =========================================================
-
 def create_keyboard() -> ReplyKeyboardMarkup:
-    """
-    Tạo bàn phím gồm 3 hàng, mỗi hàng 2 nút.
-
-    resize_keyboard=True:
-        Telegram tự điều chỉnh kích thước nút.
-
-    one_time_keyboard=False:
-        Không tự động ẩn bàn phím sau khi bấm.
-
-    is_persistent=True:
-        Yêu cầu Telegram luôn hiển thị bàn phím.
-    """
-
     keyboard = [
         [
             KeyboardButton(BUTTON_CHECKIN),
@@ -104,22 +139,68 @@ def create_keyboard() -> ReplyKeyboardMarkup:
 
 
 # =========================================================
-# LỆNH /start VÀ /menu
+# GHI GOOGLE SHEETS
+# =========================================================
+
+def append_to_sheet(row: list[str]) -> None:
+    """Ghi một dòng mới vào Google Sheets."""
+
+    if worksheet is None:
+        raise RuntimeError(
+            "Google Sheets chưa được kết nối."
+        )
+
+    worksheet.append_row(
+        row,
+        value_input_option="USER_ENTERED",
+    )
+
+
+async def save_record(
+    date_text: str,
+    time_text: str,
+    action: str,
+    status: str,
+    user_id: int,
+    telegram_name: str,
+    username: str,
+) -> None:
+    """
+    Chạy thao tác Google Sheets ở luồng riêng,
+    tránh làm bot bị đứng khi Google phản hồi chậm.
+    """
+
+    row = [
+        date_text,
+        time_text,
+        action,
+        status,
+        str(user_id),
+        telegram_name,
+        username,
+    ]
+
+    await asyncio.to_thread(
+        append_to_sheet,
+        row,
+    )
+
+
+# =========================================================
+# /start VÀ /menu
 # =========================================================
 
 async def show_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Hiển thị bàn phím chức năng."""
-
     message = update.effective_message
 
     if message is None:
         return
 
     await message.reply_text(
-        text=(
+        (
             "Hệ thống quản lý ca làm việc sẵn sàng. "
             "Vui lòng chọn chức năng:"
         ),
@@ -128,26 +209,23 @@ async def show_menu(
 
 
 # =========================================================
-# LỆNH /id
+# /id
 # =========================================================
 
 async def show_chat_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Hiển thị ID của nhóm Telegram."""
-
     message = update.effective_message
     chat = update.effective_chat
 
     if message is None or chat is None:
         return
 
-    chat_name = chat.title or "Tin nhắn riêng"
-
     await message.reply_text(
-        text=(
-            f"👥 Tên nhóm: {chat_name}\n"
+        (
+            f"👥 Tên nhóm: "
+            f"{chat.title or 'Tin nhắn riêng'}\n"
             f"🆔 Group ID: {chat.id}"
         ),
         reply_markup=create_keyboard(),
@@ -155,15 +233,13 @@ async def show_chat_id(
 
 
 # =========================================================
-# XỬ LÝ CÁC NÚT
+# XỬ LÝ NÚT
 # =========================================================
 
 async def handle_keyboard_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Xử lý nội dung khi người dùng bấm nút."""
-
     message = update.effective_message
     user = update.effective_user
     chat = update.effective_chat
@@ -171,7 +247,11 @@ async def handle_keyboard_button(
     if message is None or user is None or chat is None:
         return
 
-    button_text = message.text.strip() if message.text else ""
+    button_text = (
+        message.text.strip()
+        if message.text
+        else ""
+    )
 
     valid_buttons = {
         BUTTON_CHECKIN,
@@ -182,117 +262,124 @@ async def handle_keyboard_button(
         BUTTON_CHECK,
     }
 
-    # Không xử lý những tin nhắn bình thường ngoài các nút
     if button_text not in valid_buttons:
         return
 
-    current_time = datetime.now(
-        TIME_ZONE
-    ).strftime("%Y-%m-%d %H:%M:%S")
+    # Chỉ cho nhóm đã cấu hình ghi dữ liệu
+    if chat.id != ALLOWED_GROUP_ID:
+        await message.reply_text(
+            "⚠️ Nhóm này chưa được kết nối Google Sheets.",
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    now = datetime.now(TIME_ZONE)
+
+    date_text = now.strftime("%Y-%m-%d")
+    time_text = now.strftime("%H:%M:%S")
 
     username = (
         f"@{user.username}"
         if user.username
-        else "Không có username"
+        else ""
     )
 
-    group_name = chat.title or "Tin nhắn riêng"
-    group_id = chat.id
-
-    # -----------------------------------------------------
-    # NÚT KIỂM TRA
-    # -----------------------------------------------------
-
+    # Nút kiểm tra không ghi thêm một dòng thao tác
     if button_text == BUTTON_CHECK:
         await message.reply_text(
-            text=(
-                "📋 THÔNG TIN KIỂM TRA\n\n"
+            (
+                "📋 Hệ thống đang hoạt động.\n\n"
                 f"👤 Người kiểm tra: {user.full_name}\n"
-                f"🔗 Username: {username}\n"
-                f"👥 Nhóm: {group_name}\n"
-                f"🆔 Group ID: {group_id}\n"
-                f"🕐 Thời gian: {current_time}\n\n"
-                "Google Sheets sẽ được kết nối "
-                "ở bước tiếp theo."
+                f"🕐 Thời gian: {date_text} {time_text}\n"
+                f"🆔 Group ID: {chat.id}"
             ),
             reply_markup=create_keyboard(),
         )
         return
 
-    # -----------------------------------------------------
-    # TÊN HÀNH ĐỘNG
-    # -----------------------------------------------------
-
     action_names = {
-        BUTTON_CHECKIN: "✅ Lên ca",
-        BUTTON_CHECKOUT: "🏁 Xuống ca",
-        BUTTON_WC: "🚻 Đi WC",
-        BUTTON_BREAK: "🍚 Đi ăn",
-        BUTTON_BACK: "↩️ Quay lại",
+        BUTTON_CHECKIN: "上班/checkin",
+        BUTTON_CHECKOUT: "下班/checkout",
+        BUTTON_WC: "WC",
+        BUTTON_BREAK: "吃饭/break",
+        BUTTON_BACK: "回/back",
     }
 
-    action_name = action_names.get(
-        button_text,
-        button_text,
-    )
+    action = action_names[button_text]
+    status = "Đã ghi nhận"
+
+    try:
+        await save_record(
+            date_text=date_text,
+            time_text=time_text,
+            action=action,
+            status=status,
+            user_id=user.id,
+            telegram_name=user.full_name,
+            username=username,
+        )
+
+    except Exception:
+        logger.exception(
+            "Không thể ghi dữ liệu vào Google Sheets."
+        )
+
+        await message.reply_text(
+            (
+                "❌ Không thể ghi dữ liệu vào Google Sheets.\n"
+                "Vui lòng báo quản trị viên kiểm tra Render Logs."
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
 
     await message.reply_text(
-        text=(
-            "✅ ĐÃ GHI NHẬN THAO TÁC\n\n"
-            f"👤 Người thao tác: {user.full_name}\n"
-            f"🔗 Username: {username}\n"
-            f"🔘 Hành động: {action_name}\n"
-            f"🕐 Thời gian: {current_time}\n"
-            f"👥 Nhóm: {group_name}\n"
-            f"🆔 Group ID: {group_id}"
+        (
+            "✅ ĐÃ GHI NHẬN\n\n"
+            f"👤 {user.full_name}\n"
+            f"🔘 {action}\n"
+            f"📅 {date_text}\n"
+            f"🕐 {time_text}"
         ),
         reply_markup=create_keyboard(),
     )
 
 
 # =========================================================
-# CÀI DANH SÁCH LỆNH
+# KHỞI TẠO
 # =========================================================
 
 async def post_init(
     application: Application,
 ) -> None:
-    """Cài đặt các lệnh Telegram."""
+    global worksheet
 
     commands = [
-        BotCommand(
-            command="start",
-            description="Khởi động bot",
-        ),
-        BotCommand(
-            command="menu",
-            description="Hiển thị bàn phím",
-        ),
-        BotCommand(
-            command="id",
-            description="Xem Group ID",
-        ),
+        BotCommand("start", "Khởi động bot"),
+        BotCommand("menu", "Hiển thị bàn phím"),
+        BotCommand("id", "Xem Group ID"),
     ]
 
     await application.bot.set_my_commands(
         commands
     )
 
-    logger.info(
-        "Đã cài đặt danh sách lệnh."
+    # Kết nối Google Sheets ở luồng riêng
+    worksheet = await asyncio.to_thread(
+        create_worksheet
     )
 
+    logger.info(
+        "Đã kết nối Google Sheets: %s / %s",
+        SPREADSHEET_ID,
+        WORKSHEET_NAME,
+    )
 
-# =========================================================
-# XỬ LÝ LỖI
-# =========================================================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Ghi lỗi trong Render Logs."""
-
     logger.exception(
         "Bot gặp lỗi.",
         exc_info=context.error,
@@ -300,15 +387,13 @@ async def error_handler(
 
 
 # =========================================================
-# KHỞI ĐỘNG BOT
+# CHẠY BOT
 # =========================================================
 
 def main() -> None:
-    """Khởi động bot bằng webhook trên Render."""
-
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Không tìm thấy BOT_TOKEN trong Render Environment."
+            "Không tìm thấy BOT_TOKEN."
         )
 
     if not RENDER_EXTERNAL_HOSTNAME:
@@ -328,31 +413,18 @@ def main() -> None:
         .build()
     )
 
-    # Lệnh /start
     application.add_handler(
-        CommandHandler(
-            "start",
-            show_menu,
-        )
+        CommandHandler("start", show_menu)
     )
 
-    # Lệnh /menu
     application.add_handler(
-        CommandHandler(
-            "menu",
-            show_menu,
-        )
+        CommandHandler("menu", show_menu)
     )
 
-    # Lệnh /id
     application.add_handler(
-        CommandHandler(
-            "id",
-            show_chat_id,
-        )
+        CommandHandler("id", show_chat_id)
     )
 
-    # Xử lý nội dung từ các nút Reply Keyboard
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -362,15 +434,6 @@ def main() -> None:
 
     application.add_error_handler(
         error_handler
-    )
-
-    logger.info(
-        "Bot đang khởi động."
-    )
-
-    logger.info(
-        "Webhook URL: %s",
-        webhook_url,
     )
 
     application.run_webhook(
