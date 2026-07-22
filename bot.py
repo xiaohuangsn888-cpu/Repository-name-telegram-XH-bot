@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# TELEGRAM / RENDER 设置
+# TELEGRAM 与 RENDER 设置
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -84,6 +84,9 @@ WORKSHEET_NAME = "Trang tính1"
 # 只允许这个群组使用
 ALLOWED_GROUP_ID = -1004440715006
 
+# 只有这个 Telegram User ID 可以使用“检查”
+ADMIN_USER_ID = 6096917665
+
 # 菲律宾时间
 TIME_ZONE = ZoneInfo("Asia/Manila")
 
@@ -108,7 +111,7 @@ BUTTON_RETURN = "返回"
 BUTTON_CHECK = "检查"
 
 
-# 兼容旧键盘
+# 兼容旧按钮
 BUTTON_ALIASES = {
     "上班/checkin": BUTTON_CHECKIN,
     "下班/checkout": BUTTON_CHECKOUT,
@@ -126,24 +129,26 @@ BUTTON_ALIASES = {
 ACTIVITY_CONFIG = {
     BUTTON_TOILET: {
         "name": "去厕所",
+        "return_action": "去厕所返回",
         "limit_seconds": 10 * 60,
         "limit_minutes": 10,
     },
     BUTTON_MEAL: {
         "name": "吃饭",
+        "return_action": "吃饭返回",
         "limit_seconds": 30 * 60,
         "limit_minutes": 30,
     },
 }
 
 
-# 正在吃饭或去厕所的记录
-# 键值：(chat_id, user_id)
+# 当前正在吃饭或去厕所的人员
+# 格式：(群组 ID, 用户 ID)
 ACTIVE_SESSIONS: dict[tuple[int, int], dict] = {}
 
 
 # =========================================================
-# 创建中文键盘
+# 创建键盘
 # =========================================================
 
 def create_keyboard() -> ReplyKeyboardMarkup:
@@ -172,15 +177,11 @@ def create_keyboard() -> ReplyKeyboardMarkup:
 
 
 # =========================================================
-# 查找 GOOGLE JSON 凭据
+# GOOGLE 凭据文件
 # =========================================================
 
 def find_google_credentials_file() -> Path:
-    """
-    自动寻找 Render Secret File。
-    """
-
-    candidate_paths: list[Path] = []
+    candidate_paths = []
 
     custom_path = os.getenv(
         "GOOGLE_CREDENTIALS_FILE",
@@ -214,7 +215,7 @@ def find_google_credentials_file() -> Path:
             )
             return file_path
 
-    # 如果文件名不同，自动寻找 /etc/secrets 中的 JSON
+    # 自动搜索 /etc/secrets 中的 JSON
     secret_directory = Path("/etc/secrets")
 
     if secret_directory.is_dir():
@@ -229,20 +230,16 @@ def find_google_credentials_file() -> Path:
             )
             return json_files[0]
 
-    checked = ", ".join(
+    checked_paths = ", ".join(
         str(path)
         for path in candidate_paths
     )
 
     raise FileNotFoundError(
         "找不到 Google 凭据 JSON 文件。"
-        f"已检查：{checked}"
+        f"已检查：{checked_paths}"
     )
 
-
-# =========================================================
-# 创建 GOOGLE 凭据
-# =========================================================
 
 def create_google_credentials() -> Credentials:
     """
@@ -268,27 +265,23 @@ def create_google_credentials() -> Credentials:
                 "不是有效的 JSON。"
             ) from error
 
-        return (
-            Credentials.from_service_account_info(
-                credentials_data,
-                scopes=GOOGLE_SCOPES,
-            )
+        return Credentials.from_service_account_info(
+            credentials_data,
+            scopes=GOOGLE_SCOPES,
         )
 
     credentials_file = (
         find_google_credentials_file()
     )
 
-    return (
-        Credentials.from_service_account_file(
-            str(credentials_file),
-            scopes=GOOGLE_SCOPES,
-        )
+    return Credentials.from_service_account_file(
+        str(credentials_file),
+        scopes=GOOGLE_SCOPES,
     )
 
 
 # =========================================================
-# 连接 GOOGLE SHEETS
+# GOOGLE SHEETS 连接
 # =========================================================
 
 def get_worksheet():
@@ -322,10 +315,6 @@ def get_worksheet():
 def append_sheet_row(
     row: list[str],
 ) -> None:
-    """
-    将一行数据添加到 Google Sheets 最后一行。
-    """
-
     global WORKSHEET_CACHE
 
     try:
@@ -338,7 +327,21 @@ def append_sheet_row(
             )
 
     except Exception:
-        # 下次操作时重新连接
+        with SHEET_LOCK:
+            WORKSHEET_CACHE = None
+
+        raise
+
+
+def read_all_sheet_rows() -> list[list[str]]:
+    global WORKSHEET_CACHE
+
+    try:
+        with SHEET_LOCK:
+            worksheet = get_worksheet()
+            return worksheet.get_all_values()
+
+    except Exception:
         with SHEET_LOCK:
             WORKSHEET_CACHE = None
 
@@ -386,13 +389,6 @@ async def save_record(
 def format_duration(
     total_seconds: float,
 ) -> str:
-    """
-    例如：
-    8分钟15秒
-    30分钟
-    45秒
-    """
-
     seconds = max(
         0,
         int(total_seconds),
@@ -434,20 +430,20 @@ def create_session_key(
     return chat_id, user_id
 
 
-def create_job_name(
+def create_session_id(
     chat_id: int,
     user_id: int,
     started_at: datetime,
 ) -> str:
     return (
-        f"timeout-{chat_id}-"
+        f"{chat_id}-"
         f"{user_id}-"
         f"{int(started_at.timestamp())}"
     )
 
 
 # =========================================================
-# 超时警告任务
+# 超时提醒
 # =========================================================
 
 async def timeout_warning_job(
@@ -476,11 +472,11 @@ async def timeout_warning_job(
         session_key
     )
 
-    # 员工已经点击返回
+    # 已经返回
     if session is None:
         return
 
-    # 防止旧任务发送错误提醒
+    # 防止旧任务错误提醒
     if session.get("session_id") != session_id:
         return
 
@@ -508,7 +504,7 @@ async def timeout_warning_job(
         session["full_name"],
     )
 
-    warning_message = (
+    warning_text = (
         "⚠️ <b>超时提醒</b>\n\n"
         f"👤 员工：{mention}\n"
         f"📌 事项："
@@ -527,15 +523,13 @@ async def timeout_warning_job(
     try:
         await context.bot.send_message(
             chat_id=session["chat_id"],
-            text=warning_message,
+            text=warning_text,
             parse_mode=ParseMode.HTML,
             reply_markup=create_keyboard(),
         )
 
         logger.warning(
-            "员工超时：chat_id=%s "
-            "user_id=%s activity=%s",
-            session["chat_id"],
+            "员工超时：user_id=%s activity=%s",
             session["user_id"],
             session["activity"],
         )
@@ -546,13 +540,10 @@ async def timeout_warning_job(
         )
 
 
-# =========================================================
-# 创建超时任务
-# =========================================================
-
 def schedule_timeout_job(
     application: Application,
     session: dict,
+    delay_seconds: float | None = None,
 ) -> None:
     if application.job_queue is None:
         raise RuntimeError(
@@ -560,20 +551,22 @@ def schedule_timeout_job(
             "请检查 requirements.txt。"
         )
 
-    session_id = session["session_id"]
+    if delay_seconds is None:
+        delay_seconds = (
+            session["limit_seconds"] + 1
+        )
 
     job = application.job_queue.run_once(
         callback=timeout_warning_job,
-        when=session["limit_seconds"],
+        when=max(1, delay_seconds),
         data={
             "chat_id": session["chat_id"],
             "user_id": session["user_id"],
-            "session_id": session_id,
+            "session_id": session["session_id"],
         },
-        name=create_job_name(
-            session["chat_id"],
-            session["user_id"],
-            session["started_at"],
+        name=(
+            f"timeout-"
+            f"{session['session_id']}"
         ),
         chat_id=session["chat_id"],
         user_id=session["user_id"],
@@ -615,12 +608,13 @@ async def start_timed_activity(
         now = datetime.now(TIME_ZONE)
 
         elapsed_seconds = (
-            now - old_session["started_at"]
+            now
+            - old_session["started_at"]
         ).total_seconds()
 
         await message.reply_text(
             (
-                "⚠️ 您还有一条未完成的记录。\n\n"
+                "⚠️ 您还有未结束的记录。\n\n"
                 f"📌 当前事项："
                 f"{old_session['activity']}\n"
                 f"🕐 开始时间："
@@ -639,19 +633,20 @@ async def start_timed_activity(
 
     now = datetime.now(TIME_ZONE)
 
-    session_id = (
-        f"{chat.id}-"
-        f"{user.id}-"
-        f"{int(now.timestamp())}"
-    )
-
     session = {
-        "session_id": session_id,
+        "session_id": create_session_id(
+            chat.id,
+            user.id,
+            now,
+        ),
         "chat_id": chat.id,
         "user_id": user.id,
         "full_name": user.full_name,
         "username": user.username or "",
         "activity": config["name"],
+        "return_action": config[
+            "return_action"
+        ],
         "started_at": now,
         "limit_seconds": config[
             "limit_seconds"
@@ -662,6 +657,37 @@ async def start_timed_activity(
         "alerted": False,
         "job": None,
     }
+
+    start_status = (
+        "进行中，规定时间"
+        f"{config['limit_minutes']}分钟"
+    )
+
+    try:
+        await save_record(
+            action=config["name"],
+            status=start_status,
+            user_id=user.id,
+            full_name=user.full_name,
+            username=user.username or "",
+            record_time=now,
+        )
+
+    except Exception as error:
+        logger.exception(
+            "写入开始记录失败。"
+        )
+
+        await message.reply_text(
+            (
+                "❌ 无法写入 Google Sheets。\n"
+                f"错误类型："
+                f"{type(error).__name__}\n"
+                "本次计时没有开始。"
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
 
     ACTIVE_SESSIONS[
         session_key
@@ -694,54 +720,8 @@ async def start_timed_activity(
         )
         return
 
-    start_status = (
-        f"进行中，规定时间"
-        f"{config['limit_minutes']}分钟"
-    )
-
-    try:
-        await save_record(
-            action=config["name"],
-            status=start_status,
-            user_id=user.id,
-            full_name=user.full_name,
-            username=user.username or "",
-            record_time=now,
-        )
-
-    except Exception as error:
-        job = session.get("job")
-
-        if job is not None:
-            job.schedule_removal()
-
-        ACTIVE_SESSIONS.pop(
-            session_key,
-            None,
-        )
-
-        logger.exception(
-            "写入开始记录失败。"
-        )
-
-        await message.reply_text(
-            (
-                "❌ 无法写入 Google Sheets。\n"
-                f"错误类型："
-                f"{type(error).__name__}\n"
-                "本次计时没有开始。"
-            ),
-            reply_markup=create_keyboard(),
-        )
-        return
-
-    deadline = now.timestamp() + config[
-        "limit_seconds"
-    ]
-
-    deadline_time = datetime.fromtimestamp(
-        deadline,
-        tz=TIME_ZONE,
+    deadline = now + timedelta(
+        seconds=config["limit_seconds"]
     )
 
     mention = create_user_mention(
@@ -759,7 +739,7 @@ async def start_timed_activity(
             f"⏱ 规定时间："
             f"{config['limit_minutes']}分钟\n"
             f"🔔 最晚返回："
-            f"{deadline_time.strftime('%H:%M:%S')}\n\n"
+            f"{deadline.strftime('%H:%M:%S')}\n\n"
             "回来后请点击“返回”。"
         ),
         parse_mode=ParseMode.HTML,
@@ -768,7 +748,7 @@ async def start_timed_activity(
 
 
 # =========================================================
-# 员工点击返回
+# 返回
 # =========================================================
 
 async def return_from_activity(
@@ -802,32 +782,16 @@ async def return_from_activity(
         )
         return
 
-    # 先停止超时任务
-    job = session.get("job")
-
-    if job is not None:
-        try:
-            job.schedule_removal()
-        except Exception:
-            logger.exception(
-                "取消超时任务失败。"
-            )
-
     now = datetime.now(TIME_ZONE)
 
     elapsed_seconds = (
-        now - session["started_at"]
+        now
+        - session["started_at"]
     ).total_seconds()
 
     limit_seconds = session[
         "limit_seconds"
     ]
-
-    activity = session["activity"]
-
-    return_action = (
-        f"{activity}返回"
-    )
 
     if elapsed_seconds <= limit_seconds:
         sheet_status = (
@@ -835,15 +799,16 @@ async def return_from_activity(
             f"用时{format_duration(elapsed_seconds)}"
         )
 
-        result_title = "✅ 准时返回"
+        title = "✅ 准时返回"
 
-        result_detail = (
-            "员工在规定时间内返回。"
+        result_text = (
+            "在规定时间内返回。"
         )
 
     else:
         overtime_seconds = (
-            elapsed_seconds - limit_seconds
+            elapsed_seconds
+            - limit_seconds
         )
 
         sheet_status = (
@@ -852,17 +817,16 @@ async def return_from_activity(
             f"总用时{format_duration(elapsed_seconds)}"
         )
 
-        result_title = "⚠️ 超时返回"
+        title = "⚠️ 超时返回"
 
-        result_detail = (
-            f"员工已超时"
+        result_text = (
+            "已经超时"
             f"{format_duration(overtime_seconds)}。"
         )
 
     try:
-        # 返回时添加新的一行
         await save_record(
-            action=return_action,
+            action=session["return_action"],
             status=sheet_status,
             user_id=user.id,
             full_name=user.full_name,
@@ -880,13 +844,23 @@ async def return_from_activity(
                 "❌ 无法写入返回记录。\n"
                 f"错误类型："
                 f"{type(error).__name__}\n"
-                "请再次点击“返回”。"
+                "请稍后再次点击“返回”。"
             ),
             reply_markup=create_keyboard(),
         )
         return
 
-    # 确认写入成功后，再删除当前状态
+    # 写入成功后取消超时任务
+    job = session.get("job")
+
+    if job is not None:
+        try:
+            job.schedule_removal()
+        except Exception:
+            logger.exception(
+                "取消超时任务失败。"
+            )
+
     ACTIVE_SESSIONS.pop(
         session_key,
         None,
@@ -899,17 +873,17 @@ async def return_from_activity(
 
     await message.reply_text(
         (
-            f"<b>{result_title}</b>\n\n"
+            f"<b>{title}</b>\n\n"
             f"👤 员工：{mention}\n"
             f"📌 事项："
-            f"{html.escape(activity)}\n"
+            f"{html.escape(session['activity'])}\n"
             f"🕐 开始时间："
             f"{session['started_at'].strftime('%H:%M:%S')}\n"
             f"🕐 返回时间："
             f"{now.strftime('%H:%M:%S')}\n"
             f"⌛ 总用时："
             f"{format_duration(elapsed_seconds)}\n"
-            f"📋 结果：{result_detail}"
+            f"📋 结果：{result_text}"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=create_keyboard(),
@@ -943,7 +917,7 @@ async def record_work_action(
     if session_key in ACTIVE_SESSIONS:
         await message.reply_text(
             (
-                "⚠️ 您还有未完成的吃饭或厕所记录。\n"
+                "⚠️ 您还有未结束的吃饭或厕所记录。\n"
                 "请先点击“返回”。"
             ),
             reply_markup=create_keyboard(),
@@ -999,80 +973,242 @@ async def record_work_action(
 
 
 # =========================================================
-# 检查当前人员
+# 管理员检查今日违规
 # =========================================================
 
-async def check_current_status(
+async def check_today_violations(
     update: Update,
 ) -> None:
     message = update.effective_message
+    user = update.effective_user
     chat = update.effective_chat
 
-    if message is None or chat is None:
+    if (
+        message is None
+        or user is None
+        or chat is None
+    ):
         return
 
-    sessions = [
-        session
-        for session in ACTIVE_SESSIONS.values()
-        if session["chat_id"] == chat.id
-    ]
-
-    if not sessions:
+    # 只有管理员可以查看
+    if user.id != ADMIN_USER_ID:
         await message.reply_text(
-            "✅ 当前没有正在吃饭或去厕所的人员。",
+            "⛔ 您没有权限使用“检查”功能。",
             reply_markup=create_keyboard(),
         )
         return
 
     now = datetime.now(TIME_ZONE)
+    today_text = now.strftime("%Y-%m-%d")
+
+    violations: dict[str, dict] = {}
+
+    try:
+        rows = await asyncio.to_thread(
+            read_all_sheet_rows
+        )
+
+    except Exception as error:
+        logger.exception(
+            "读取违规记录失败。"
+        )
+
+        await message.reply_text(
+            (
+                "❌ 无法读取 Google Sheets。\n"
+                f"错误类型："
+                f"{type(error).__name__}"
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    # 检查已经返回并记录为超时的人员
+    for original_row in rows[1:]:
+        row = original_row + [""] * (
+            7 - len(original_row)
+        )
+
+        date_text = row[0].strip()
+        time_text = row[1].strip()
+        action = row[2].strip()
+        status = row[3].strip()
+        user_id_text = row[4].strip()
+        full_name = row[5].strip()
+        username = row[6].strip()
+
+        if date_text != today_text:
+            continue
+
+        if "超时返回" not in status:
+            continue
+
+        if not user_id_text:
+            user_id_text = (
+                full_name or "未知用户"
+            )
+
+        if user_id_text not in violations:
+            violations[user_id_text] = {
+                "full_name": (
+                    full_name
+                    or user_id_text
+                ),
+                "username": username,
+                "records": [],
+            }
+
+        violations[user_id_text][
+            "records"
+        ].append(
+            {
+                "time": time_text,
+                "action": action,
+                "status": status,
+                "active": False,
+            }
+        )
+
+    # 检查目前尚未返回并已超时的人员
+    for session in ACTIVE_SESSIONS.values():
+        if session["chat_id"] != chat.id:
+            continue
+
+        if (
+            session["started_at"].strftime(
+                "%Y-%m-%d"
+            )
+            != today_text
+        ):
+            continue
+
+        elapsed_seconds = (
+            now
+            - session["started_at"]
+        ).total_seconds()
+
+        if (
+            elapsed_seconds
+            <= session["limit_seconds"]
+        ):
+            continue
+
+        overtime_seconds = (
+            elapsed_seconds
+            - session["limit_seconds"]
+        )
+
+        user_id_text = str(
+            session["user_id"]
+        )
+
+        if user_id_text not in violations:
+            username = (
+                f"@{session['username']}"
+                if session["username"]
+                else ""
+            )
+
+            violations[user_id_text] = {
+                "full_name": session[
+                    "full_name"
+                ],
+                "username": username,
+                "records": [],
+            }
+
+        violations[user_id_text][
+            "records"
+        ].append(
+            {
+                "time": session[
+                    "started_at"
+                ].strftime("%H:%M:%S"),
+                "action": session[
+                    "activity"
+                ],
+                "status": (
+                    "尚未返回，"
+                    f"已超时"
+                    f"{format_duration(overtime_seconds)}"
+                ),
+                "active": True,
+            }
+        )
+
+    if not violations:
+        await message.reply_text(
+            (
+                "✅ <b>今日违规检查结果</b>\n\n"
+                f"📅 日期：{today_text}\n"
+                "今天暂时没有人员超时。"
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    total_people = len(violations)
+
+    total_records = sum(
+        len(item["records"])
+        for item in violations.values()
+    )
 
     lines = [
-        "📋 <b>当前人员状态</b>",
+        "⚠️ <b>今日违规人员</b>",
+        "",
+        f"📅 日期：{today_text}",
+        f"👥 违规人数：{total_people}人",
+        f"📋 违规次数：{total_records}次",
         "",
     ]
 
-    for session in sessions:
-        elapsed_seconds = (
-            now - session["started_at"]
-        ).total_seconds()
+    number = 1
 
-        remaining_seconds = (
-            session["limit_seconds"]
-            - elapsed_seconds
+    for violation in violations.values():
+        safe_name = html.escape(
+            violation["full_name"]
         )
 
-        if remaining_seconds >= 0:
-            state = (
-                "✅ 剩余"
-                f"{format_duration(remaining_seconds)}"
+        safe_username = html.escape(
+            violation["username"]
+        )
+
+        lines.append(
+            f"<b>{number}. {safe_name}</b>"
+        )
+
+        if safe_username:
+            lines.append(
+                f"账号：{safe_username}"
             )
-        else:
-            state = (
-                "⚠️ 已超时"
-                f"{format_duration(abs(remaining_seconds))}"
+
+        for record in violation["records"]:
+            icon = (
+                "🔴"
+                if record["active"]
+                else "🟠"
             )
 
-        mention = create_user_mention(
-            session["user_id"],
-            session["full_name"],
-        )
+            safe_action = html.escape(
+                record["action"]
+            )
 
-        lines.extend(
-            [
-                f"👤 {mention}",
-                f"📌 {session['activity']}",
+            safe_status = html.escape(
+                record["status"]
+            )
+
+            lines.append(
                 (
-                    "🕐 开始："
-                    f"{session['started_at'].strftime('%H:%M:%S')}"
-                ),
-                (
-                    "⌛ 用时："
-                    f"{format_duration(elapsed_seconds)}"
-                ),
-                f"📋 状态：{state}",
-                "",
-            ]
-        )
+                    f"{icon} {record['time']}｜"
+                    f"{safe_action}\n"
+                    f"结果：{safe_status}"
+                )
+            )
+
+        lines.append("")
+        number += 1
 
     await message.reply_text(
         "\n".join(lines),
@@ -1128,6 +1264,30 @@ async def show_group_id(
 
 
 # =========================================================
+# /myid
+# =========================================================
+
+async def show_my_user_id(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+
+    if message is None or user is None:
+        return
+
+    await message.reply_text(
+        (
+            "🆔 您的 Telegram User ID：\n"
+            f"<code>{user.id}</code>"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_keyboard(),
+    )
+
+
+# =========================================================
 # /testsheet
 # =========================================================
 
@@ -1170,7 +1330,7 @@ async def test_google_sheet(
 
 
 # =========================================================
-# 处理键盘按钮
+# 处理按钮
 # =========================================================
 
 async def handle_button(
@@ -1216,12 +1376,6 @@ async def handle_button(
         )
         return
 
-    logger.info(
-        "收到按钮：%s | chat_id=%s",
-        text,
-        chat.id,
-    )
-
     if text == BUTTON_MEAL:
         await start_timed_activity(
             update,
@@ -1243,7 +1397,7 @@ async def handle_button(
         )
 
     elif text == BUTTON_CHECK:
-        await check_current_status(
+        await check_today_violations(
             update
         )
 
@@ -1276,6 +1430,10 @@ async def post_init(
         BotCommand(
             "id",
             "查看群组 ID",
+        ),
+        BotCommand(
+            "myid",
+            "查看自己的 User ID",
         ),
         BotCommand(
             "testsheet",
@@ -1378,6 +1536,13 @@ def main() -> None:
         CommandHandler(
             "id",
             show_group_id,
+        )
+    )
+
+    application.add_handler(
+        CommandHandler(
+            "myid",
+            show_my_user_id,
         )
     )
 
