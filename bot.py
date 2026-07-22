@@ -5,19 +5,20 @@ from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     Update,
 )
 from telegram.ext import (
     Application,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 
 # =========================================================
-# GHI NHẬT KÝ
+# CẤU HÌNH LOG
 # =========================================================
 
 logging.basicConfig(
@@ -32,68 +33,74 @@ logger = logging.getLogger(__name__)
 # CẤU HÌNH RENDER
 # =========================================================
 
-# Token được nhập trong Environment Variables của Render.
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
-# Render tự cấp cổng cho Web Service.
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = int(
+    os.environ.get("PORT", "10000")
+)
 
-# Render tự cấp hostname dạng:
-# ten-dich-vu.onrender.com
 RENDER_EXTERNAL_HOSTNAME = os.environ.get(
     "RENDER_EXTERNAL_HOSTNAME"
 )
 
-# Telegram sẽ gửi cập nhật vào đường dẫn này.
 WEBHOOK_PATH = "telegram-webhook"
 
-# Giờ Philippines.
+# Giờ Philippines
 TIME_ZONE = ZoneInfo("Asia/Manila")
 
 
 # =========================================================
-# TÊN CÁC HÀNH ĐỘNG
+# TÊN CÁC NÚT
 # =========================================================
 
-ACTIONS = {
-    "meal_start": "🍚 Đi ăn",
-    "wc_start": "🚻 Đi WC",
-    "return": "↩️ Đã quay lại",
-    "check": "📋 Kiểm tra",
-}
+BUTTON_CHECKIN = "上班/checkin"
+BUTTON_CHECKOUT = "下班/checkout"
+BUTTON_WC = "WC"
+BUTTON_BREAK = "吃饭/break"
+BUTTON_BACK = "回/back"
+BUTTON_CHECK = "检查/check"
 
 
 # =========================================================
-# TẠO CÁC NÚT
+# TẠO BÀN PHÍM GIỐNG ẢNH MẪU
 # =========================================================
 
-def create_menu() -> InlineKeyboardMarkup:
-    """Tạo bảng nút hiển thị dưới tin nhắn."""
+def create_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Tạo bàn phím gồm 3 hàng, mỗi hàng 2 nút.
+
+    resize_keyboard=True:
+        Telegram tự điều chỉnh kích thước nút.
+
+    one_time_keyboard=False:
+        Không tự động ẩn bàn phím sau khi bấm.
+
+    is_persistent=True:
+        Yêu cầu Telegram luôn hiển thị bàn phím.
+    """
 
     keyboard = [
         [
-            InlineKeyboardButton(
-                text="🍚 Đi ăn",
-                callback_data="meal_start",
-            ),
-            InlineKeyboardButton(
-                text="🚻 Đi WC",
-                callback_data="wc_start",
-            ),
+            KeyboardButton(BUTTON_CHECKIN),
+            KeyboardButton(BUTTON_CHECKOUT),
         ],
         [
-            InlineKeyboardButton(
-                text="↩️ Quay lại",
-                callback_data="return",
-            ),
-            InlineKeyboardButton(
-                text="📋 Kiểm tra",
-                callback_data="check",
-            ),
+            KeyboardButton(BUTTON_WC),
+            KeyboardButton(BUTTON_BREAK),
+        ],
+        [
+            KeyboardButton(BUTTON_BACK),
+            KeyboardButton(BUTTON_CHECK),
         ],
     ]
 
-    return InlineKeyboardMarkup(keyboard)
+    return ReplyKeyboardMarkup(
+        keyboard=keyboard,
+        resize_keyboard=True,
+        one_time_keyboard=False,
+        is_persistent=True,
+        input_field_placeholder="Vui lòng chọn chức năng...",
+    )
 
 
 # =========================================================
@@ -104,7 +111,7 @@ async def show_menu(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Hiển thị các nút."""
+    """Hiển thị bàn phím chức năng."""
 
     message = update.effective_message
 
@@ -112,8 +119,11 @@ async def show_menu(
         return
 
     await message.reply_text(
-        text="📌 Vui lòng chọn thao tác:",
-        reply_markup=create_menu(),
+        text=(
+            "Hệ thống quản lý ca làm việc sẵn sàng. "
+            "Vui lòng chọn chức năng:"
+        ),
+        reply_markup=create_keyboard(),
     )
 
 
@@ -125,7 +135,7 @@ async def show_chat_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Hiển thị ID nhóm Telegram."""
+    """Hiển thị ID của nhóm Telegram."""
 
     message = update.effective_message
     chat = update.effective_chat
@@ -133,46 +143,52 @@ async def show_chat_id(
     if message is None or chat is None:
         return
 
-    group_name = chat.title or "Tin nhắn riêng"
+    chat_name = chat.title or "Tin nhắn riêng"
 
     await message.reply_text(
         text=(
-            f"👥 Tên nhóm: {group_name}\n"
+            f"👥 Tên nhóm: {chat_name}\n"
             f"🆔 Group ID: {chat.id}"
-        )
+        ),
+        reply_markup=create_keyboard(),
     )
 
 
 # =========================================================
-# XỬ LÝ NÚT
+# XỬ LÝ CÁC NÚT
 # =========================================================
 
-async def handle_button(
+async def handle_keyboard_button(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Xử lý khi thành viên nhấn nút."""
+    """Xử lý nội dung khi người dùng bấm nút."""
 
-    query = update.callback_query
-
-    if query is None:
-        return
-
-    # Dừng biểu tượng tải trên nút Telegram.
-    await query.answer()
-
-    user = query.from_user
+    message = update.effective_message
+    user = update.effective_user
     chat = update.effective_chat
 
-    action_code = query.data or ""
-    action_name = ACTIONS.get(
-        action_code,
-        "⚠️ Thao tác không xác định",
-    )
+    if message is None or user is None or chat is None:
+        return
 
-    current_time = datetime.now(TIME_ZONE).strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
+    button_text = message.text.strip() if message.text else ""
+
+    valid_buttons = {
+        BUTTON_CHECKIN,
+        BUTTON_CHECKOUT,
+        BUTTON_WC,
+        BUTTON_BREAK,
+        BUTTON_BACK,
+        BUTTON_CHECK,
+    }
+
+    # Không xử lý những tin nhắn bình thường ngoài các nút
+    if button_text not in valid_buttons:
+        return
+
+    current_time = datetime.now(
+        TIME_ZONE
+    ).strftime("%Y-%m-%d %H:%M:%S")
 
     username = (
         f"@{user.username}"
@@ -180,26 +196,48 @@ async def handle_button(
         else "Không có username"
     )
 
-    if chat is not None:
-        group_name = chat.title or "Tin nhắn riêng"
-        group_id = chat.id
-    else:
-        group_name = "Không xác định"
-        group_id = "Không xác định"
+    group_name = chat.title or "Tin nhắn riêng"
+    group_id = chat.id
 
-    if action_code == "check":
-        result = (
-            "📋 THÔNG TIN KIỂM TRA\n\n"
-            f"👤 Người kiểm tra: {user.full_name}\n"
-            f"🔗 Username: {username}\n"
-            f"👥 Nhóm: {group_name}\n"
-            f"🆔 Group ID: {group_id}\n"
-            f"🕐 Thời gian: {current_time}\n\n"
-            "ℹ️ Chức năng đọc Google Sheets "
-            "sẽ được kết nối ở bước tiếp theo."
+    # -----------------------------------------------------
+    # NÚT KIỂM TRA
+    # -----------------------------------------------------
+
+    if button_text == BUTTON_CHECK:
+        await message.reply_text(
+            text=(
+                "📋 THÔNG TIN KIỂM TRA\n\n"
+                f"👤 Người kiểm tra: {user.full_name}\n"
+                f"🔗 Username: {username}\n"
+                f"👥 Nhóm: {group_name}\n"
+                f"🆔 Group ID: {group_id}\n"
+                f"🕐 Thời gian: {current_time}\n\n"
+                "Google Sheets sẽ được kết nối "
+                "ở bước tiếp theo."
+            ),
+            reply_markup=create_keyboard(),
         )
-    else:
-        result = (
+        return
+
+    # -----------------------------------------------------
+    # TÊN HÀNH ĐỘNG
+    # -----------------------------------------------------
+
+    action_names = {
+        BUTTON_CHECKIN: "✅ Lên ca",
+        BUTTON_CHECKOUT: "🏁 Xuống ca",
+        BUTTON_WC: "🚻 Đi WC",
+        BUTTON_BREAK: "🍚 Đi ăn",
+        BUTTON_BACK: "↩️ Quay lại",
+    }
+
+    action_name = action_names.get(
+        button_text,
+        button_text,
+    )
+
+    await message.reply_text(
+        text=(
             "✅ ĐÃ GHI NHẬN THAO TÁC\n\n"
             f"👤 Người thao tác: {user.full_name}\n"
             f"🔗 Username: {username}\n"
@@ -207,21 +245,19 @@ async def handle_button(
             f"🕐 Thời gian: {current_time}\n"
             f"👥 Nhóm: {group_name}\n"
             f"🆔 Group ID: {group_id}"
-        )
-
-    if query.message is not None:
-        await query.message.reply_text(
-            text=result,
-            reply_markup=create_menu(),
-        )
+        ),
+        reply_markup=create_keyboard(),
+    )
 
 
 # =========================================================
 # CÀI DANH SÁCH LỆNH
 # =========================================================
 
-async def post_init(application: Application) -> None:
-    """Hiển thị các lệnh trong menu của Telegram."""
+async def post_init(
+    application: Application,
+) -> None:
+    """Cài đặt các lệnh Telegram."""
 
     commands = [
         BotCommand(
@@ -230,7 +266,7 @@ async def post_init(application: Application) -> None:
         ),
         BotCommand(
             command="menu",
-            description="Hiển thị các nút",
+            description="Hiển thị bàn phím",
         ),
         BotCommand(
             command="id",
@@ -238,9 +274,13 @@ async def post_init(application: Application) -> None:
         ),
     ]
 
-    await application.bot.set_my_commands(commands)
+    await application.bot.set_my_commands(
+        commands
+    )
 
-    logger.info("Đã cài danh sách lệnh Telegram.")
+    logger.info(
+        "Đã cài đặt danh sách lệnh."
+    )
 
 
 # =========================================================
@@ -251,10 +291,10 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    """Hiển thị lỗi trong Render Logs."""
+    """Ghi lỗi trong Render Logs."""
 
     logger.exception(
-        "Bot gặp lỗi khi xử lý dữ liệu.",
+        "Bot gặp lỗi.",
         exc_info=context.error,
     )
 
@@ -264,22 +304,21 @@ async def error_handler(
 # =========================================================
 
 def main() -> None:
-    """Khởi động bot bằng webhook."""
+    """Khởi động bot bằng webhook trên Render."""
 
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Không tìm thấy BOT_TOKEN. "
-            "Hãy thêm BOT_TOKEN trong Render Environment."
+            "Không tìm thấy BOT_TOKEN trong Render Environment."
         )
 
     if not RENDER_EXTERNAL_HOSTNAME:
         raise RuntimeError(
-            "Không tìm thấy RENDER_EXTERNAL_HOSTNAME. "
-            "Hãy triển khai dưới dạng Render Web Service."
+            "Không tìm thấy RENDER_EXTERNAL_HOSTNAME."
         )
 
     webhook_url = (
-        f"https://{RENDER_EXTERNAL_HOSTNAME}/{WEBHOOK_PATH}"
+        f"https://{RENDER_EXTERNAL_HOSTNAME}/"
+        f"{WEBHOOK_PATH}"
     )
 
     application = (
@@ -289,6 +328,7 @@ def main() -> None:
         .build()
     )
 
+    # Lệnh /start
     application.add_handler(
         CommandHandler(
             "start",
@@ -296,6 +336,7 @@ def main() -> None:
         )
     )
 
+    # Lệnh /menu
     application.add_handler(
         CommandHandler(
             "menu",
@@ -303,6 +344,7 @@ def main() -> None:
         )
     )
 
+    # Lệnh /id
     application.add_handler(
         CommandHandler(
             "id",
@@ -310,17 +352,26 @@ def main() -> None:
         )
     )
 
+    # Xử lý nội dung từ các nút Reply Keyboard
     application.add_handler(
-        CallbackQueryHandler(
-            handle_button,
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_keyboard_button,
         )
     )
 
-    application.add_error_handler(error_handler)
+    application.add_error_handler(
+        error_handler
+    )
 
-    logger.info("Bot đang khởi động.")
-    logger.info("Webhook: %s", webhook_url)
-    logger.info("Port: %s", PORT)
+    logger.info(
+        "Bot đang khởi động."
+    )
+
+    logger.info(
+        "Webhook URL: %s",
+        webhook_url,
+    )
 
     application.run_webhook(
         listen="0.0.0.0",
