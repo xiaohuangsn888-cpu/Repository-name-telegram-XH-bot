@@ -96,26 +96,24 @@ WORKSHEET_CACHE = None
 
 
 # =========================================================
-# 上班时间
+# 班次设置
 # =========================================================
 
 DAY_SHIFT_START = time(8, 0)
 DAY_SHIFT_END = time(20, 0)
 
-# 夜班：20:00 到第二天 08:00
 NIGHT_SHIFT_START = time(20, 0)
 NIGHT_SHIFT_END = time(8, 0)
 
 
 # =========================================================
-# 中文按钮
+# 按钮设置
 # =========================================================
 
 BUTTON_CHECKIN = "上班"
 BUTTON_CHECKOUT = "下班"
 BUTTON_TOILET = "去厕所"
 BUTTON_MEAL = "吃饭"
-BUTTON_REST = "休息"
 BUTTON_RETURN = "返回"
 BUTTON_CHECK = "检查"
 
@@ -130,7 +128,7 @@ BUTTON_ALIASES = {
 
 
 # =========================================================
-# 休息时间规定
+# 吃饭和厕所时间规定
 # =========================================================
 
 ACTIVITY_CONFIG = {
@@ -139,39 +137,29 @@ ACTIVITY_CONFIG = {
         "return_action": "去厕所返回",
         "alert_action": "去厕所超时提醒",
         "limit_minutes": 10,
+        "limit_seconds": 10 * 60,
     },
     BUTTON_MEAL: {
         "name": "吃饭",
         "return_action": "吃饭返回",
         "alert_action": "吃饭超时提醒",
         "limit_minutes": 30,
-    },
-    BUTTON_REST: {
-        "name": "休息",
-        "return_action": "休息返回",
-        "alert_action": "休息超时提醒",
-        "limit_minutes": 15,
+        "limit_seconds": 30 * 60,
     },
 }
-
-for config in ACTIVITY_CONFIG.values():
-    config["limit_seconds"] = (
-        config["limit_minutes"] * 60
-    )
 
 
 # =========================================================
 # 当前状态
 # =========================================================
 
-# 当前已上班人员
-# 键：(chat_id, user_id)
+# 已经上班的人员
 ACTIVE_WORK_SESSIONS: dict[
     tuple[int, int],
     dict,
 ] = {}
 
-# 当前吃饭、休息或上厕所人员
+# 正在吃饭或去厕所的人员
 ACTIVE_ACTIVITY_SESSIONS: dict[
     tuple[int, int],
     dict,
@@ -179,7 +167,7 @@ ACTIVE_ACTIVITY_SESSIONS: dict[
 
 
 # =========================================================
-# 键盘
+# 中文键盘
 # =========================================================
 
 def create_keyboard() -> ReplyKeyboardMarkup:
@@ -191,7 +179,6 @@ def create_keyboard() -> ReplyKeyboardMarkup:
         [
             KeyboardButton(BUTTON_TOILET),
             KeyboardButton(BUTTON_MEAL),
-            KeyboardButton(BUTTON_REST),
         ],
         [
             KeyboardButton(BUTTON_RETURN),
@@ -221,16 +208,11 @@ def find_google_credentials_file() -> Path:
     ).strip()
 
     if custom_path:
-        candidate_paths.append(
-            Path(custom_path)
-        )
+        candidate_paths.append(Path(custom_path))
 
     candidate_paths.extend(
         [
-            Path(
-                "/etc/secrets/"
-                "google-credentials.json"
-            ),
+            Path("/etc/secrets/google-credentials.json"),
             Path(
                 "/opt/render/project/src/"
                 "google-credentials.json"
@@ -279,8 +261,7 @@ def create_google_credentials() -> Credentials:
             )
         except json.JSONDecodeError as error:
             raise ValueError(
-                "GOOGLE_CREDENTIALS_JSON "
-                "不是有效的 JSON。"
+                "GOOGLE_CREDENTIALS_JSON 不是有效的 JSON。"
             ) from error
 
         return Credentials.from_service_account_info(
@@ -309,30 +290,21 @@ def get_worksheet():
         if WORKSHEET_CACHE is not None:
             return WORKSHEET_CACHE
 
-        credentials = (
-            create_google_credentials()
-        )
-
-        client = gspread.authorize(
-            credentials
-        )
+        credentials = create_google_credentials()
+        client = gspread.authorize(credentials)
 
         spreadsheet = client.open_by_key(
             SPREADSHEET_ID
         )
 
-        WORKSHEET_CACHE = (
-            spreadsheet.worksheet(
-                WORKSHEET_NAME
-            )
+        WORKSHEET_CACHE = spreadsheet.worksheet(
+            WORKSHEET_NAME
         )
 
         return WORKSHEET_CACHE
 
 
-def append_sheet_row(
-    row: list[str],
-) -> None:
+def append_sheet_row(row: list[str]) -> None:
     global WORKSHEET_CACHE
 
     try:
@@ -458,6 +430,7 @@ def get_shift_info(
 ) -> dict:
     current_time = moment.time()
 
+    # 白班：08:00 到 20:00
     if (
         DAY_SHIFT_START
         <= current_time
@@ -484,11 +457,10 @@ def get_shift_info(
             "schedule": "08:00-20:00",
         }
 
-    # 20:00 之后属于当晚夜班
+    # 夜班：20:00 到第二天08:00
     if current_time >= NIGHT_SHIFT_START:
         shift_start_date = moment.date()
     else:
-        # 00:00-08:00 属于前一天开始的夜班
         shift_start_date = (
             moment.date()
             - timedelta(days=1)
@@ -518,17 +490,18 @@ def activity_is_overtime(
     session: dict,
     now: datetime,
 ) -> bool:
-    elapsed = (
+    elapsed_seconds = (
         now - session["started_at"]
     ).total_seconds()
 
-    return elapsed > session[
-        "limit_seconds"
-    ]
+    return (
+        elapsed_seconds
+        > session["limit_seconds"]
+    )
 
 
 # =========================================================
-# 超时提醒任务
+# 超时提醒
 # =========================================================
 
 async def timeout_warning_job(
@@ -576,7 +549,7 @@ async def timeout_warning_job(
     ).total_seconds()
 
     overtime_seconds = max(
-        0,
+        1,
         elapsed_seconds
         - session["limit_seconds"],
     )
@@ -600,7 +573,7 @@ async def timeout_warning_job(
         f"❗ 已经超时："
         f"{format_duration(overtime_seconds)}\n\n"
         "该员工已经超过规定时间，"
-        "目前仍然没有返回，请尽快处理。"
+        "目前仍然没有返回，请尽快返回。"
     )
 
     try:
@@ -614,9 +587,8 @@ async def timeout_warning_job(
         await save_record(
             action=session["alert_action"],
             status=(
-                "已超时且尚未返回，"
-                f"超时"
-                f"{format_duration(overtime_seconds)}"
+                "已超过规定时间，"
+                "目前尚未返回"
             ),
             user_id=session["user_id"],
             full_name=session["full_name"],
@@ -633,22 +605,18 @@ async def timeout_warning_job(
 def schedule_timeout_job(
     application: Application,
     session: dict,
-    delay_seconds: float | None = None,
 ) -> None:
     if application.job_queue is None:
         raise RuntimeError(
-            "JobQueue 未启用，"
-            "请检查 requirements.txt。"
+            "JobQueue 未启用，请检查 requirements.txt。"
         )
-
-    if delay_seconds is None:
-        delay_seconds = session[
-            "limit_seconds"
-        ]
 
     job = application.job_queue.run_once(
         callback=timeout_warning_job,
-        when=max(1, delay_seconds),
+
+        # 增加1秒，避免显示超时0秒
+        when=session["limit_seconds"] + 1,
+
         data={
             "chat_id": session["chat_id"],
             "user_id": session["user_id"],
@@ -809,7 +777,7 @@ async def check_out(
         await message.reply_text(
             (
                 "⚠️ 您目前还有未结束的"
-                "吃饭、休息或厕所记录。\n"
+                "吃饭或厕所记录。\n"
                 "请先点击“返回”，然后再下班。"
             ),
             reply_markup=create_keyboard(),
@@ -878,7 +846,7 @@ async def check_out(
 
 
 # =========================================================
-# 开始吃饭、休息或上厕所
+# 开始吃饭或上厕所
 # =========================================================
 
 async def start_activity(
@@ -908,7 +876,7 @@ async def start_activity(
             (
                 "⛔ 您还没有上班打卡。\n\n"
                 "必须先点击“上班”，"
-                "才可以吃饭、休息或去厕所。"
+                "才可以吃饭或去厕所。"
             ),
             reply_markup=create_keyboard(),
         )
@@ -1093,7 +1061,7 @@ async def return_from_activity(
         await message.reply_text(
             (
                 "⚠️ 您目前没有进行中的"
-                "吃饭、休息或厕所记录。"
+                "吃饭或厕所记录。"
             ),
             reply_markup=create_keyboard(),
         )
@@ -1245,6 +1213,7 @@ async def check_today_violations(
         )
         return
 
+    # 已经返回的超时记录
     for original_row in rows[1:]:
         row = original_row + [""] * (
             7 - len(original_row)
@@ -1255,10 +1224,7 @@ async def check_today_violations(
 
         status = row[3].strip()
 
-        if (
-            "超时返回" not in status
-            and "尚未返回" not in status
-        ):
+        if "超时返回" not in status:
             continue
 
         violations.append(
@@ -1271,7 +1237,7 @@ async def check_today_violations(
             }
         )
 
-    # 当前还没有返回并且已经超时
+    # 当前仍未返回并且已经超时
     for session in (
         ACTIVE_ACTIVITY_SESSIONS.values()
     ):
@@ -1298,17 +1264,13 @@ async def check_today_violations(
                 "time": session[
                     "started_at"
                 ].strftime("%H:%M:%S"),
-                "action": session[
-                    "activity"
-                ],
+                "action": session["activity"],
                 "status": (
                     "尚未返回，"
                     f"已超时"
                     f"{format_duration(overtime_seconds)}"
                 ),
-                "name": session[
-                    "full_name"
-                ],
+                "name": session["full_name"],
                 "username": (
                     f"@{session['username']}"
                     if session["username"]
@@ -1347,14 +1309,10 @@ async def check_today_violations(
                     f"<b>{index}. "
                     f"{html.escape(record['name'])}</b>"
                 ),
+                f"🕐 {html.escape(record['time'])}",
+                f"📌 {html.escape(record['action'])}",
                 (
-                    f"🕐 {html.escape(record['time'])}"
-                ),
-                (
-                    f"📌 {html.escape(record['action'])}"
-                ),
-                (
-                    f"结果："
+                    "结果："
                     f"{html.escape(record['status'])}"
                 ),
                 "",
@@ -1369,7 +1327,7 @@ async def check_today_violations(
 
 
 # =========================================================
-# 菜单及测试
+# 菜单和测试
 # =========================================================
 
 async def show_menu(
@@ -1384,10 +1342,12 @@ async def show_menu(
     await message.reply_text(
         (
             "✅ 考勤系统已经启动。\n\n"
-            "白班：08:00-20:00\n"
-            "夜班：20:00-08:00\n\n"
-            "必须先上班打卡，"
-            "才可以吃饭、休息或去厕所。"
+            "☀️ 白班：08:00-20:00\n"
+            "🌙 夜班：20:00-08:00\n\n"
+            "必须先点击“上班”，"
+            "才可以吃饭或去厕所。\n\n"
+            "吃饭：30分钟\n"
+            "去厕所：10分钟"
         ),
         reply_markup=create_keyboard(),
     )
@@ -1500,7 +1460,6 @@ async def handle_button(
         BUTTON_CHECKOUT,
         BUTTON_TOILET,
         BUTTON_MEAL,
-        BUTTON_REST,
         BUTTON_RETURN,
         BUTTON_CHECK,
     }
@@ -1602,7 +1561,7 @@ async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    logger.exception(
+    logger.error(
         "机器人发生未处理错误。",
         exc_info=context.error,
     )
