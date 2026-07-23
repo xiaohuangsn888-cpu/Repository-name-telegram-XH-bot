@@ -85,7 +85,7 @@ WORKSHEET_NAME = "Trang tính1"
 ALLOWED_GROUP_ID = -1004302603671
 
 # 只有这个 Telegram User ID 可以使用“检查”
-ADMIN_USER_ID = 6096917665
+ADMIN_USER_ID = 1004302603671
 
 # 菲律宾时间
 TIME_ZONE = ZoneInfo("Asia/Manila")
