@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 
 # =========================================================
-# TELEGRAM 与 RENDER 设置
+# TELEGRAM / RENDER 设置
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -72,7 +72,7 @@ WEBHOOK_URL = (
 
 
 # =========================================================
-# GOOGLE SHEETS 设置
+# 系统设置
 # =========================================================
 
 SPREADSHEET_ID = (
@@ -81,13 +81,9 @@ SPREADSHEET_ID = (
 
 WORKSHEET_NAME = "Trang tính1"
 
-# 只允许这个群组使用
-ALLOWED_GROUP_ID = -1004302603671
-
-# 只有这个 Telegram User ID 可以使用“检查”
+ALLOWED_GROUP_ID = -5311403542
 ADMIN_USER_ID = 6096917665
 
-# 菲律宾时间
 TIME_ZONE = ZoneInfo("Asia/Manila")
 
 GOOGLE_SCOPES = [
@@ -100,6 +96,18 @@ WORKSHEET_CACHE = None
 
 
 # =========================================================
+# 上班时间
+# =========================================================
+
+DAY_SHIFT_START = time(8, 0)
+DAY_SHIFT_END = time(20, 0)
+
+# 夜班：20:00 到第二天 08:00
+NIGHT_SHIFT_START = time(20, 0)
+NIGHT_SHIFT_END = time(8, 0)
+
+
+# =========================================================
 # 中文按钮
 # =========================================================
 
@@ -107,11 +115,10 @@ BUTTON_CHECKIN = "上班"
 BUTTON_CHECKOUT = "下班"
 BUTTON_TOILET = "去厕所"
 BUTTON_MEAL = "吃饭"
+BUTTON_REST = "休息"
 BUTTON_RETURN = "返回"
 BUTTON_CHECK = "检查"
 
-
-# 兼容旧按钮
 BUTTON_ALIASES = {
     "上班/checkin": BUTTON_CHECKIN,
     "下班/checkout": BUTTON_CHECKOUT,
@@ -123,32 +130,56 @@ BUTTON_ALIASES = {
 
 
 # =========================================================
-# 时间限制
+# 休息时间规定
 # =========================================================
 
 ACTIVITY_CONFIG = {
     BUTTON_TOILET: {
         "name": "去厕所",
         "return_action": "去厕所返回",
-        "limit_seconds": 10 * 60,
+        "alert_action": "去厕所超时提醒",
         "limit_minutes": 10,
     },
     BUTTON_MEAL: {
         "name": "吃饭",
         "return_action": "吃饭返回",
-        "limit_seconds": 30 * 60,
+        "alert_action": "吃饭超时提醒",
         "limit_minutes": 30,
+    },
+    BUTTON_REST: {
+        "name": "休息",
+        "return_action": "休息返回",
+        "alert_action": "休息超时提醒",
+        "limit_minutes": 15,
     },
 }
 
-
-# 当前正在吃饭或去厕所的人员
-# 格式：(群组 ID, 用户 ID)
-ACTIVE_SESSIONS: dict[tuple[int, int], dict] = {}
+for config in ACTIVITY_CONFIG.values():
+    config["limit_seconds"] = (
+        config["limit_minutes"] * 60
+    )
 
 
 # =========================================================
-# 创建键盘
+# 当前状态
+# =========================================================
+
+# 当前已上班人员
+# 键：(chat_id, user_id)
+ACTIVE_WORK_SESSIONS: dict[
+    tuple[int, int],
+    dict,
+] = {}
+
+# 当前吃饭、休息或上厕所人员
+ACTIVE_ACTIVITY_SESSIONS: dict[
+    tuple[int, int],
+    dict,
+] = {}
+
+
+# =========================================================
+# 键盘
 # =========================================================
 
 def create_keyboard() -> ReplyKeyboardMarkup:
@@ -160,6 +191,7 @@ def create_keyboard() -> ReplyKeyboardMarkup:
         [
             KeyboardButton(BUTTON_TOILET),
             KeyboardButton(BUTTON_MEAL),
+            KeyboardButton(BUTTON_REST),
         ],
         [
             KeyboardButton(BUTTON_RETURN),
@@ -177,11 +209,11 @@ def create_keyboard() -> ReplyKeyboardMarkup:
 
 
 # =========================================================
-# GOOGLE 凭据文件
+# GOOGLE 凭据
 # =========================================================
 
 def find_google_credentials_file() -> Path:
-    candidate_paths = []
+    candidate_paths: list[Path] = []
 
     custom_path = os.getenv(
         "GOOGLE_CREDENTIALS_FILE",
@@ -215,7 +247,6 @@ def find_google_credentials_file() -> Path:
             )
             return file_path
 
-    # 自动搜索 /etc/secrets 中的 JSON
     secret_directory = Path("/etc/secrets")
 
     if secret_directory.is_dir():
@@ -230,25 +261,12 @@ def find_google_credentials_file() -> Path:
             )
             return json_files[0]
 
-    checked_paths = ", ".join(
-        str(path)
-        for path in candidate_paths
-    )
-
     raise FileNotFoundError(
         "找不到 Google 凭据 JSON 文件。"
-        f"已检查：{checked_paths}"
     )
 
 
 def create_google_credentials() -> Credentials:
-    """
-    支持两种方法：
-
-    1. Render Secret File
-    2. GOOGLE_CREDENTIALS_JSON 环境变量
-    """
-
     credentials_json = os.getenv(
         "GOOGLE_CREDENTIALS_JSON",
         "",
@@ -281,7 +299,7 @@ def create_google_credentials() -> Credentials:
 
 
 # =========================================================
-# GOOGLE SHEETS 连接
+# GOOGLE SHEETS
 # =========================================================
 
 def get_worksheet():
@@ -386,27 +404,11 @@ async def save_record(
 # 工具函数
 # =========================================================
 
-def format_duration(
-    total_seconds: float,
-) -> str:
-    seconds = max(
-        0,
-        int(total_seconds),
-    )
-
-    minutes = seconds // 60
-    remaining_seconds = seconds % 60
-
-    if minutes == 0:
-        return f"{remaining_seconds}秒"
-
-    if remaining_seconds == 0:
-        return f"{minutes}分钟"
-
-    return (
-        f"{minutes}分钟"
-        f"{remaining_seconds}秒"
-    )
+def create_session_key(
+    chat_id: int,
+    user_id: int,
+) -> tuple[int, int]:
+    return chat_id, user_id
 
 
 def create_user_mention(
@@ -423,27 +425,110 @@ def create_user_mention(
     )
 
 
-def create_session_key(
-    chat_id: int,
-    user_id: int,
-) -> tuple[int, int]:
-    return chat_id, user_id
-
-
-def create_session_id(
-    chat_id: int,
-    user_id: int,
-    started_at: datetime,
+def format_duration(
+    total_seconds: float,
 ) -> str:
-    return (
-        f"{chat_id}-"
-        f"{user_id}-"
-        f"{int(started_at.timestamp())}"
+    seconds = max(
+        0,
+        int(total_seconds),
     )
+
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    remaining_seconds = seconds % 60
+
+    parts = []
+
+    if hours:
+        parts.append(f"{hours}小时")
+
+    if minutes:
+        parts.append(f"{minutes}分钟")
+
+    if remaining_seconds or not parts:
+        parts.append(
+            f"{remaining_seconds}秒"
+        )
+
+    return "".join(parts)
+
+
+def get_shift_info(
+    moment: datetime,
+) -> dict:
+    current_time = moment.time()
+
+    if (
+        DAY_SHIFT_START
+        <= current_time
+        < DAY_SHIFT_END
+    ):
+        shift_date = moment.date()
+
+        shift_start = datetime.combine(
+            shift_date,
+            DAY_SHIFT_START,
+            tzinfo=TIME_ZONE,
+        )
+
+        shift_end = datetime.combine(
+            shift_date,
+            DAY_SHIFT_END,
+            tzinfo=TIME_ZONE,
+        )
+
+        return {
+            "name": "白班",
+            "start": shift_start,
+            "end": shift_end,
+            "schedule": "08:00-20:00",
+        }
+
+    # 20:00 之后属于当晚夜班
+    if current_time >= NIGHT_SHIFT_START:
+        shift_start_date = moment.date()
+    else:
+        # 00:00-08:00 属于前一天开始的夜班
+        shift_start_date = (
+            moment.date()
+            - timedelta(days=1)
+        )
+
+    shift_start = datetime.combine(
+        shift_start_date,
+        NIGHT_SHIFT_START,
+        tzinfo=TIME_ZONE,
+    )
+
+    shift_end = datetime.combine(
+        shift_start_date + timedelta(days=1),
+        NIGHT_SHIFT_END,
+        tzinfo=TIME_ZONE,
+    )
+
+    return {
+        "name": "夜班",
+        "start": shift_start,
+        "end": shift_end,
+        "schedule": "20:00-08:00",
+    }
+
+
+def activity_is_overtime(
+    session: dict,
+    now: datetime,
+) -> bool:
+    elapsed = (
+        now - session["started_at"]
+    ).total_seconds()
+
+    return elapsed > session[
+        "limit_seconds"
+    ]
 
 
 # =========================================================
-# 超时提醒
+# 超时提醒任务
 # =========================================================
 
 async def timeout_warning_job(
@@ -468,19 +553,16 @@ async def timeout_warning_job(
         int(user_id),
     )
 
-    session = ACTIVE_SESSIONS.get(
+    session = ACTIVE_ACTIVITY_SESSIONS.get(
         session_key
     )
 
-    # 已经返回
     if session is None:
         return
 
-    # 防止旧任务错误提醒
     if session.get("session_id") != session_id:
         return
 
-    # 防止重复提醒
     if session.get("alerted"):
         return
 
@@ -505,19 +587,20 @@ async def timeout_warning_job(
     )
 
     warning_text = (
-        "⚠️ <b>超时提醒</b>\n\n"
+        "⚠️ <b>超时未返回提醒</b>\n\n"
         f"👤 员工：{mention}\n"
         f"📌 事项："
         f"{html.escape(session['activity'])}\n"
-        f"🕐 开始时间："
+        f"🕐 离开时间："
         f"{session['started_at'].strftime('%H:%M:%S')}\n"
         f"⏱ 规定时间："
         f"{session['limit_minutes']}分钟\n"
         f"⌛ 当前用时："
         f"{format_duration(elapsed_seconds)}\n"
-        f"❗ 已超时："
+        f"❗ 已经超时："
         f"{format_duration(overtime_seconds)}\n\n"
-        "请尽快返回并点击“返回”。"
+        "该员工已经超过规定时间，"
+        "目前仍然没有返回，请尽快处理。"
     )
 
     try:
@@ -528,10 +611,17 @@ async def timeout_warning_job(
             reply_markup=create_keyboard(),
         )
 
-        logger.warning(
-            "员工超时：user_id=%s activity=%s",
-            session["user_id"],
-            session["activity"],
+        await save_record(
+            action=session["alert_action"],
+            status=(
+                "已超时且尚未返回，"
+                f"超时"
+                f"{format_duration(overtime_seconds)}"
+            ),
+            user_id=session["user_id"],
+            full_name=session["full_name"],
+            username=session["username"],
+            record_time=now,
         )
 
     except Exception:
@@ -547,14 +637,14 @@ def schedule_timeout_job(
 ) -> None:
     if application.job_queue is None:
         raise RuntimeError(
-            "JobQueue 未启用。"
+            "JobQueue 未启用，"
             "请检查 requirements.txt。"
         )
 
     if delay_seconds is None:
-        delay_seconds = (
-            session["limit_seconds"] + 1
-        )
+        delay_seconds = session[
+            "limit_seconds"
+        ]
 
     job = application.job_queue.run_once(
         callback=timeout_warning_job,
@@ -565,7 +655,7 @@ def schedule_timeout_job(
             "session_id": session["session_id"],
         },
         name=(
-            f"timeout-"
+            f"activity-timeout-"
             f"{session['session_id']}"
         ),
         chat_id=session["chat_id"],
@@ -576,10 +666,222 @@ def schedule_timeout_job(
 
 
 # =========================================================
-# 开始吃饭或去厕所
+# 上班
 # =========================================================
 
-async def start_timed_activity(
+async def check_in(
+    update: Update,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if (
+        message is None
+        or user is None
+        or chat is None
+    ):
+        return
+
+    session_key = create_session_key(
+        chat.id,
+        user.id,
+    )
+
+    if session_key in ACTIVE_WORK_SESSIONS:
+        old_session = ACTIVE_WORK_SESSIONS[
+            session_key
+        ]
+
+        await message.reply_text(
+            (
+                "⚠️ 您已经上班打卡，"
+                "不能重复打卡。\n\n"
+                f"班次：{old_session['shift_name']}\n"
+                f"上班时间："
+                f"{old_session['started_at'].strftime('%H:%M:%S')}"
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    now = datetime.now(TIME_ZONE)
+    shift = get_shift_info(now)
+
+    status = (
+        f"{shift['name']}上班，"
+        f"班次时间{shift['schedule']}"
+    )
+
+    try:
+        await save_record(
+            action=BUTTON_CHECKIN,
+            status=status,
+            user_id=user.id,
+            full_name=user.full_name,
+            username=user.username or "",
+            record_time=now,
+        )
+
+    except Exception as error:
+        logger.exception(
+            "写入上班记录失败。"
+        )
+
+        await message.reply_text(
+            (
+                "❌ 上班打卡失败。\n"
+                f"错误类型："
+                f"{type(error).__name__}"
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    ACTIVE_WORK_SESSIONS[
+        session_key
+    ] = {
+        "chat_id": chat.id,
+        "user_id": user.id,
+        "full_name": user.full_name,
+        "username": user.username or "",
+        "started_at": now,
+        "shift_name": shift["name"],
+        "shift_schedule": shift["schedule"],
+        "shift_start": shift["start"],
+        "shift_end": shift["end"],
+    }
+
+    mention = create_user_mention(
+        user.id,
+        user.full_name,
+    )
+
+    await message.reply_text(
+        (
+            "🟢 <b>上班打卡成功</b>\n\n"
+            f"👤 员工：{mention}\n"
+            f"📋 班次：{shift['name']}\n"
+            f"⏰ 班次时间：{shift['schedule']}\n"
+            f"🕐 打卡时间："
+            f"{now.strftime('%H:%M:%S')}"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_keyboard(),
+    )
+
+
+# =========================================================
+# 下班
+# =========================================================
+
+async def check_out(
+    update: Update,
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+
+    if (
+        message is None
+        or user is None
+        or chat is None
+    ):
+        return
+
+    session_key = create_session_key(
+        chat.id,
+        user.id,
+    )
+
+    work_session = ACTIVE_WORK_SESSIONS.get(
+        session_key
+    )
+
+    if work_session is None:
+        await message.reply_text(
+            "⚠️ 您还没有上班打卡，不能下班打卡。",
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    if session_key in ACTIVE_ACTIVITY_SESSIONS:
+        await message.reply_text(
+            (
+                "⚠️ 您目前还有未结束的"
+                "吃饭、休息或厕所记录。\n"
+                "请先点击“返回”，然后再下班。"
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    now = datetime.now(TIME_ZONE)
+
+    worked_seconds = (
+        now - work_session["started_at"]
+    ).total_seconds()
+
+    status = (
+        f"{work_session['shift_name']}下班，"
+        f"本次工作"
+        f"{format_duration(worked_seconds)}"
+    )
+
+    try:
+        await save_record(
+            action=BUTTON_CHECKOUT,
+            status=status,
+            user_id=user.id,
+            full_name=user.full_name,
+            username=user.username or "",
+            record_time=now,
+        )
+
+    except Exception as error:
+        logger.exception(
+            "写入下班记录失败。"
+        )
+
+        await message.reply_text(
+            (
+                "❌ 下班打卡失败。\n"
+                f"错误类型："
+                f"{type(error).__name__}"
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    ACTIVE_WORK_SESSIONS.pop(
+        session_key,
+        None,
+    )
+
+    await message.reply_text(
+        (
+            "🔴 <b>下班打卡成功</b>\n\n"
+            f"👤 员工："
+            f"{html.escape(user.full_name)}\n"
+            f"📋 班次："
+            f"{work_session['shift_name']}\n"
+            f"🕐 上班："
+            f"{work_session['started_at'].strftime('%H:%M:%S')}\n"
+            f"🕐 下班："
+            f"{now.strftime('%H:%M:%S')}\n"
+            f"⌛ 工作时间："
+            f"{format_duration(worked_seconds)}"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=create_keyboard(),
+    )
+
+
+# =========================================================
+# 开始吃饭、休息或上厕所
+# =========================================================
+
+async def start_activity(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     activity: str,
@@ -600,26 +902,40 @@ async def start_timed_activity(
         user.id,
     )
 
-    old_session = ACTIVE_SESSIONS.get(
-        session_key
+    # 必须先上班
+    if session_key not in ACTIVE_WORK_SESSIONS:
+        await message.reply_text(
+            (
+                "⛔ 您还没有上班打卡。\n\n"
+                "必须先点击“上班”，"
+                "才可以吃饭、休息或去厕所。"
+            ),
+            reply_markup=create_keyboard(),
+        )
+        return
+
+    old_activity = (
+        ACTIVE_ACTIVITY_SESSIONS.get(
+            session_key
+        )
     )
 
-    if old_session is not None:
+    if old_activity is not None:
         now = datetime.now(TIME_ZONE)
 
         elapsed_seconds = (
             now
-            - old_session["started_at"]
+            - old_activity["started_at"]
         ).total_seconds()
 
         await message.reply_text(
             (
                 "⚠️ 您还有未结束的记录。\n\n"
-                f"📌 当前事项："
-                f"{old_session['activity']}\n"
-                f"🕐 开始时间："
-                f"{old_session['started_at'].strftime('%H:%M:%S')}\n"
-                f"⌛ 当前用时："
+                f"当前事项："
+                f"{old_activity['activity']}\n"
+                f"开始时间："
+                f"{old_activity['started_at'].strftime('%H:%M:%S')}\n"
+                f"当前用时："
                 f"{format_duration(elapsed_seconds)}\n\n"
                 "请先点击“返回”。"
             ),
@@ -634,10 +950,10 @@ async def start_timed_activity(
     now = datetime.now(TIME_ZONE)
 
     session = {
-        "session_id": create_session_id(
-            chat.id,
-            user.id,
-            now,
+        "session_id": (
+            f"{chat.id}-"
+            f"{user.id}-"
+            f"{int(now.timestamp())}"
         ),
         "chat_id": chat.id,
         "user_id": user.id,
@@ -647,26 +963,27 @@ async def start_timed_activity(
         "return_action": config[
             "return_action"
         ],
-        "started_at": now,
-        "limit_seconds": config[
-            "limit_seconds"
+        "alert_action": config[
+            "alert_action"
         ],
+        "started_at": now,
         "limit_minutes": config[
             "limit_minutes"
+        ],
+        "limit_seconds": config[
+            "limit_seconds"
         ],
         "alerted": False,
         "job": None,
     }
 
-    start_status = (
-        "进行中，规定时间"
-        f"{config['limit_minutes']}分钟"
-    )
-
     try:
         await save_record(
             action=config["name"],
-            status=start_status,
+            status=(
+                "进行中，规定时间"
+                f"{config['limit_minutes']}分钟"
+            ),
             user_id=user.id,
             full_name=user.full_name,
             username=user.username or "",
@@ -675,21 +992,20 @@ async def start_timed_activity(
 
     except Exception as error:
         logger.exception(
-            "写入开始记录失败。"
+            "写入活动开始记录失败。"
         )
 
         await message.reply_text(
             (
                 "❌ 无法写入 Google Sheets。\n"
                 f"错误类型："
-                f"{type(error).__name__}\n"
-                "本次计时没有开始。"
+                f"{type(error).__name__}"
             ),
             reply_markup=create_keyboard(),
         )
         return
 
-    ACTIVE_SESSIONS[
+    ACTIVE_ACTIVITY_SESSIONS[
         session_key
     ] = session
 
@@ -700,21 +1016,20 @@ async def start_timed_activity(
         )
 
     except Exception as error:
-        ACTIVE_SESSIONS.pop(
+        ACTIVE_ACTIVITY_SESSIONS.pop(
             session_key,
             None,
         )
 
         logger.exception(
-            "创建计时任务失败。"
+            "创建超时任务失败。"
         )
 
         await message.reply_text(
             (
-                "❌ 无法启动计时任务。\n"
+                "❌ 无法启动计时器。\n"
                 f"错误类型："
-                f"{type(error).__name__}\n"
-                "请检查 requirements.txt。"
+                f"{type(error).__name__}"
             ),
             reply_markup=create_keyboard(),
         )
@@ -734,13 +1049,13 @@ async def start_timed_activity(
             "✅ <b>计时已经开始</b>\n\n"
             f"👤 员工：{mention}\n"
             f"📌 事项：{config['name']}\n"
-            f"🕐 开始时间："
+            f"🕐 离开时间："
             f"{now.strftime('%H:%M:%S')}\n"
             f"⏱ 规定时间："
             f"{config['limit_minutes']}分钟\n"
             f"🔔 最晚返回："
             f"{deadline.strftime('%H:%M:%S')}\n\n"
-            "回来后请点击“返回”。"
+            "回来后必须点击“返回”。"
         ),
         parse_mode=ParseMode.HTML,
         reply_markup=create_keyboard(),
@@ -753,7 +1068,6 @@ async def start_timed_activity(
 
 async def return_from_activity(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -771,13 +1085,16 @@ async def return_from_activity(
         user.id,
     )
 
-    session = ACTIVE_SESSIONS.get(
+    session = ACTIVE_ACTIVITY_SESSIONS.get(
         session_key
     )
 
     if session is None:
         await message.reply_text(
-            "⚠️ 您目前没有进行中的吃饭或厕所记录。",
+            (
+                "⚠️ 您目前没有进行中的"
+                "吃饭、休息或厕所记录。"
+            ),
             reply_markup=create_keyboard(),
         )
         return
@@ -785,30 +1102,24 @@ async def return_from_activity(
     now = datetime.now(TIME_ZONE)
 
     elapsed_seconds = (
-        now
-        - session["started_at"]
+        now - session["started_at"]
     ).total_seconds()
 
-    limit_seconds = session[
+    if elapsed_seconds <= session[
         "limit_seconds"
-    ]
-
-    if elapsed_seconds <= limit_seconds:
+    ]:
         sheet_status = (
             "准时返回，"
             f"用时{format_duration(elapsed_seconds)}"
         )
 
         title = "✅ 准时返回"
-
-        result_text = (
-            "在规定时间内返回。"
-        )
+        result_text = "在规定时间内返回。"
 
     else:
         overtime_seconds = (
             elapsed_seconds
-            - limit_seconds
+            - session["limit_seconds"]
         )
 
         sheet_status = (
@@ -843,14 +1154,12 @@ async def return_from_activity(
             (
                 "❌ 无法写入返回记录。\n"
                 f"错误类型："
-                f"{type(error).__name__}\n"
-                "请稍后再次点击“返回”。"
+                f"{type(error).__name__}"
             ),
             reply_markup=create_keyboard(),
         )
         return
 
-    # 写入成功后取消超时任务
     job = session.get("job")
 
     if job is not None:
@@ -861,7 +1170,7 @@ async def return_from_activity(
                 "取消超时任务失败。"
             )
 
-    ACTIVE_SESSIONS.pop(
+    ACTIVE_ACTIVITY_SESSIONS.pop(
         session_key,
         None,
     )
@@ -877,7 +1186,7 @@ async def return_from_activity(
             f"👤 员工：{mention}\n"
             f"📌 事项："
             f"{html.escape(session['activity'])}\n"
-            f"🕐 开始时间："
+            f"🕐 离开时间："
             f"{session['started_at'].strftime('%H:%M:%S')}\n"
             f"🕐 返回时间："
             f"{now.strftime('%H:%M:%S')}\n"
@@ -891,89 +1200,7 @@ async def return_from_activity(
 
 
 # =========================================================
-# 上班与下班
-# =========================================================
-
-async def record_work_action(
-    update: Update,
-    action: str,
-) -> None:
-    message = update.effective_message
-    user = update.effective_user
-    chat = update.effective_chat
-
-    if (
-        message is None
-        or user is None
-        or chat is None
-    ):
-        return
-
-    session_key = create_session_key(
-        chat.id,
-        user.id,
-    )
-
-    if session_key in ACTIVE_SESSIONS:
-        await message.reply_text(
-            (
-                "⚠️ 您还有未结束的吃饭或厕所记录。\n"
-                "请先点击“返回”。"
-            ),
-            reply_markup=create_keyboard(),
-        )
-        return
-
-    now = datetime.now(TIME_ZONE)
-
-    try:
-        await save_record(
-            action=action,
-            status="已记录",
-            user_id=user.id,
-            full_name=user.full_name,
-            username=user.username or "",
-            record_time=now,
-        )
-
-    except Exception as error:
-        logger.exception(
-            "写入上下班记录失败。"
-        )
-
-        await message.reply_text(
-            (
-                "❌ 无法写入 Google Sheets。\n"
-                f"错误类型："
-                f"{type(error).__name__}"
-            ),
-            reply_markup=create_keyboard(),
-        )
-        return
-
-    icon = (
-        "🟢"
-        if action == BUTTON_CHECKIN
-        else "🔴"
-    )
-
-    await message.reply_text(
-        (
-            f"{icon} <b>{action}记录成功</b>\n\n"
-            f"👤 员工："
-            f"{html.escape(user.full_name)}\n"
-            f"📅 日期："
-            f"{now.strftime('%Y-%m-%d')}\n"
-            f"🕐 时间："
-            f"{now.strftime('%H:%M:%S')}"
-        ),
-        parse_mode=ParseMode.HTML,
-        reply_markup=create_keyboard(),
-    )
-
-
-# =========================================================
-# 管理员检查今日违规
+# 管理员检查
 # =========================================================
 
 async def check_today_violations(
@@ -990,7 +1217,6 @@ async def check_today_violations(
     ):
         return
 
-    # 只有管理员可以查看
     if user.id != ADMIN_USER_ID:
         await message.reply_text(
             "⛔ 您没有权限使用“检查”功能。",
@@ -1001,7 +1227,7 @@ async def check_today_violations(
     now = datetime.now(TIME_ZONE)
     today_text = now.strftime("%Y-%m-%d")
 
-    violations: dict[str, dict] = {}
+    violations = []
 
     try:
         rows = await asyncio.to_thread(
@@ -1009,10 +1235,6 @@ async def check_today_violations(
         )
 
     except Exception as error:
-        logger.exception(
-            "读取违规记录失败。"
-        )
-
         await message.reply_text(
             (
                 "❌ 无法读取 Google Sheets。\n"
@@ -1023,103 +1245,55 @@ async def check_today_violations(
         )
         return
 
-    # 检查已经返回并记录为超时的人员
     for original_row in rows[1:]:
         row = original_row + [""] * (
             7 - len(original_row)
         )
 
-        date_text = row[0].strip()
-        time_text = row[1].strip()
-        action = row[2].strip()
+        if row[0].strip() != today_text:
+            continue
+
         status = row[3].strip()
-        user_id_text = row[4].strip()
-        full_name = row[5].strip()
-        username = row[6].strip()
 
-        if date_text != today_text:
+        if (
+            "超时返回" not in status
+            and "尚未返回" not in status
+        ):
             continue
 
-        if "超时返回" not in status:
-            continue
-
-        if not user_id_text:
-            user_id_text = (
-                full_name or "未知用户"
-            )
-
-        if user_id_text not in violations:
-            violations[user_id_text] = {
-                "full_name": (
-                    full_name
-                    or user_id_text
-                ),
-                "username": username,
-                "records": [],
-            }
-
-        violations[user_id_text][
-            "records"
-        ].append(
+        violations.append(
             {
-                "time": time_text,
-                "action": action,
+                "time": row[1].strip(),
+                "action": row[2].strip(),
                 "status": status,
-                "active": False,
+                "name": row[5].strip(),
+                "username": row[6].strip(),
             }
         )
 
-    # 检查目前尚未返回并已超时的人员
-    for session in ACTIVE_SESSIONS.values():
+    # 当前还没有返回并且已经超时
+    for session in (
+        ACTIVE_ACTIVITY_SESSIONS.values()
+    ):
         if session["chat_id"] != chat.id:
             continue
 
-        if (
-            session["started_at"].strftime(
-                "%Y-%m-%d"
-            )
-            != today_text
+        if not activity_is_overtime(
+            session,
+            now,
         ):
             continue
 
         elapsed_seconds = (
-            now
-            - session["started_at"]
+            now - session["started_at"]
         ).total_seconds()
-
-        if (
-            elapsed_seconds
-            <= session["limit_seconds"]
-        ):
-            continue
 
         overtime_seconds = (
             elapsed_seconds
             - session["limit_seconds"]
         )
 
-        user_id_text = str(
-            session["user_id"]
-        )
-
-        if user_id_text not in violations:
-            username = (
-                f"@{session['username']}"
-                if session["username"]
-                else ""
-            )
-
-            violations[user_id_text] = {
-                "full_name": session[
-                    "full_name"
-                ],
-                "username": username,
-                "records": [],
-            }
-
-        violations[user_id_text][
-            "records"
-        ].append(
+        violations.append(
             {
                 "time": session[
                     "started_at"
@@ -1132,7 +1306,14 @@ async def check_today_violations(
                     f"已超时"
                     f"{format_duration(overtime_seconds)}"
                 ),
-                "active": True,
+                "name": session[
+                    "full_name"
+                ],
+                "username": (
+                    f"@{session['username']}"
+                    if session["username"]
+                    else ""
+                ),
             }
         )
 
@@ -1141,74 +1322,44 @@ async def check_today_violations(
             (
                 "✅ <b>今日违规检查结果</b>\n\n"
                 f"📅 日期：{today_text}\n"
-                "今天暂时没有人员超时。"
+                "今天暂时没有超时记录。"
             ),
             parse_mode=ParseMode.HTML,
             reply_markup=create_keyboard(),
         )
         return
 
-    total_people = len(violations)
-
-    total_records = sum(
-        len(item["records"])
-        for item in violations.values()
-    )
-
     lines = [
-        "⚠️ <b>今日违规人员</b>",
+        "⚠️ <b>今日违规记录</b>",
         "",
         f"📅 日期：{today_text}",
-        f"👥 违规人数：{total_people}人",
-        f"📋 违规次数：{total_records}次",
+        f"📋 违规次数：{len(violations)}次",
         "",
     ]
 
-    number = 1
-
-    for violation in violations.values():
-        safe_name = html.escape(
-            violation["full_name"]
-        )
-
-        safe_username = html.escape(
-            violation["username"]
-        )
-
-        lines.append(
-            f"<b>{number}. {safe_name}</b>"
-        )
-
-        if safe_username:
-            lines.append(
-                f"账号：{safe_username}"
-            )
-
-        for record in violation["records"]:
-            icon = (
-                "🔴"
-                if record["active"]
-                else "🟠"
-            )
-
-            safe_action = html.escape(
-                record["action"]
-            )
-
-            safe_status = html.escape(
-                record["status"]
-            )
-
-            lines.append(
+    for index, record in enumerate(
+        violations,
+        start=1,
+    ):
+        lines.extend(
+            [
                 (
-                    f"{icon} {record['time']}｜"
-                    f"{safe_action}\n"
-                    f"结果：{safe_status}"
-                )
-            )
-
-        lines.append("")
-        number += 1
+                    f"<b>{index}. "
+                    f"{html.escape(record['name'])}</b>"
+                ),
+                (
+                    f"🕐 {html.escape(record['time'])}"
+                ),
+                (
+                    f"📌 {html.escape(record['action'])}"
+                ),
+                (
+                    f"结果："
+                    f"{html.escape(record['status'])}"
+                ),
+                "",
+            ]
+        )
 
     await message.reply_text(
         "\n".join(lines),
@@ -1218,7 +1369,7 @@ async def check_today_violations(
 
 
 # =========================================================
-# /start 与 /menu
+# 菜单及测试
 # =========================================================
 
 async def show_menu(
@@ -1233,15 +1384,14 @@ async def show_menu(
     await message.reply_text(
         (
             "✅ 考勤系统已经启动。\n\n"
-            "请选择下面的功能："
+            "白班：08:00-20:00\n"
+            "夜班：20:00-08:00\n\n"
+            "必须先上班打卡，"
+            "才可以吃饭、休息或去厕所。"
         ),
         reply_markup=create_keyboard(),
     )
 
-
-# =========================================================
-# /id
-# =========================================================
 
 async def show_group_id(
     update: Update,
@@ -1263,10 +1413,6 @@ async def show_group_id(
     )
 
 
-# =========================================================
-# /myid
-# =========================================================
-
 async def show_my_user_id(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1286,10 +1432,6 @@ async def show_my_user_id(
         reply_markup=create_keyboard(),
     )
 
-
-# =========================================================
-# /testsheet
-# =========================================================
 
 async def test_google_sheet(
     update: Update,
@@ -1322,15 +1464,14 @@ async def test_google_sheet(
             (
                 "❌ Google Sheets 连接失败。\n"
                 f"错误类型："
-                f"{type(error).__name__}\n"
-                "请检查 Render 日志和 Secret File。"
+                f"{type(error).__name__}"
             ),
             reply_markup=create_keyboard(),
         )
 
 
 # =========================================================
-# 处理按钮
+# 按钮处理
 # =========================================================
 
 async def handle_button(
@@ -1359,6 +1500,7 @@ async def handle_button(
         BUTTON_CHECKOUT,
         BUTTON_TOILET,
         BUTTON_MEAL,
+        BUTTON_REST,
         BUTTON_RETURN,
         BUTTON_CHECK,
     }
@@ -1376,24 +1518,22 @@ async def handle_button(
         )
         return
 
-    if text == BUTTON_MEAL:
-        await start_timed_activity(
-            update,
-            context,
-            BUTTON_MEAL,
-        )
+    if text == BUTTON_CHECKIN:
+        await check_in(update)
 
-    elif text == BUTTON_TOILET:
-        await start_timed_activity(
+    elif text == BUTTON_CHECKOUT:
+        await check_out(update)
+
+    elif text in ACTIVITY_CONFIG:
+        await start_activity(
             update,
             context,
-            BUTTON_TOILET,
+            text,
         )
 
     elif text == BUTTON_RETURN:
         await return_from_activity(
-            update,
-            context,
+            update
         )
 
     elif text == BUTTON_CHECK:
@@ -1401,18 +1541,9 @@ async def handle_button(
             update
         )
 
-    elif text in {
-        BUTTON_CHECKIN,
-        BUTTON_CHECKOUT,
-    }:
-        await record_work_action(
-            update,
-            text,
-        )
-
 
 # =========================================================
-# 启动后的设置
+# 启动设置
 # =========================================================
 
 async def post_init(
@@ -1445,11 +1576,6 @@ async def post_init(
         await application.bot.set_my_commands(
             commands
         )
-
-        logger.info(
-            "Telegram 命令设置成功。"
-        )
-
     except Exception:
         logger.exception(
             "Telegram 命令设置失败。"
@@ -1471,10 +1597,6 @@ async def post_init(
             "机器人继续运行。"
         )
 
-
-# =========================================================
-# 全局错误处理
-# =========================================================
 
 async def error_handler(
     update: object,
@@ -1500,16 +1622,6 @@ def main() -> None:
         raise RuntimeError(
             "找不到 Render 外部网址。"
         )
-
-    logger.info(
-        "机器人正在启动，端口：%s",
-        PORT,
-    )
-
-    logger.info(
-        "Webhook 地址：%s",
-        WEBHOOK_URL,
-    )
 
     application = (
         Application.builder()
