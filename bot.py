@@ -105,6 +105,10 @@ DAY_SHIFT_END = time(20, 0)
 NIGHT_SHIFT_START = time(20, 0)
 NIGHT_SHIFT_END = time(8, 0)
 
+# Thời gian bắt đầu được phép nhận diện ca
+DAY_CHECKIN_START = time(7, 0)
+NIGHT_CHECKIN_START = time(19, 0)
+
 
 # =========================================================
 # 按钮设置
@@ -164,6 +168,12 @@ ACTIVE_ACTIVITY_SESSIONS: dict[
     tuple[int, int],
     dict,
 ] = {}
+
+
+# Restore active state from Google Sheets after Render/bot restarts.
+# A normal shift is 12 hours; 18 hours allows a reasonable checkout grace period.
+MAX_WORK_SESSION_HOURS = 18
+MAX_ACTIVITY_SESSION_HOURS = 18
 
 
 # =========================================================
@@ -372,6 +382,272 @@ async def save_record(
     )
 
 
+
+# =========================================================
+# 从 GOOGLE SHEETS 恢复进行中的状态
+# =========================================================
+
+def parse_sheet_datetime(date_text: str, time_text: str) -> datetime | None:
+    """Parse a Sheet date/time using the bot timezone."""
+    value = f"{date_text.strip()} {time_text.strip()}"
+
+    for date_format in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(
+                value,
+                date_format,
+            ).replace(tzinfo=TIME_ZONE)
+        except ValueError:
+            continue
+
+    return None
+
+
+def build_work_session_from_row(
+    chat_id: int,
+    user_id: int,
+    full_name: str,
+    username: str,
+    started_at: datetime,
+) -> dict:
+    shift = get_shift_info(started_at)
+
+    return {
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "full_name": full_name,
+        "username": username.lstrip("@"),
+        "started_at": started_at,
+        "shift_name": shift["name"],
+        "shift_schedule": shift["schedule"],
+        "shift_start": shift["start"],
+        "shift_end": shift["end"],
+        "restored": True,
+    }
+
+
+def build_activity_session_from_row(
+    chat_id: int,
+    user_id: int,
+    full_name: str,
+    username: str,
+    activity: str,
+    started_at: datetime,
+) -> dict | None:
+    config = ACTIVITY_CONFIG.get(activity)
+
+    if config is None:
+        return None
+
+    return {
+        "session_id": (
+            f"restored-{chat_id}-{user_id}-"
+            f"{int(started_at.timestamp())}"
+        ),
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "full_name": full_name,
+        "username": username.lstrip("@"),
+        "activity": config["name"],
+        "return_action": config["return_action"],
+        "alert_action": config["alert_action"],
+        "started_at": started_at,
+        "limit_minutes": config["limit_minutes"],
+        "limit_seconds": config["limit_seconds"],
+        "alerted": False,
+        "job": None,
+        "restored": True,
+    }
+
+
+def reconstruct_active_sessions(
+    rows: list[list[str]],
+    now: datetime,
+) -> tuple[dict, dict]:
+    """
+    Reconstruct open work/activity sessions from Sheet history.
+
+    The Sheet remains the durable source of truth. This prevents state loss
+    when Render restarts, redeploys, sleeps, or changes worker processes.
+    """
+    states: dict[int, dict] = {}
+
+    for original_row in rows[1:]:
+        row = original_row + [""] * (7 - len(original_row))
+        record_time = parse_sheet_datetime(row[0], row[1])
+
+        if record_time is None:
+            continue
+
+        try:
+            user_id = int(row[4].strip())
+        except (TypeError, ValueError):
+            continue
+
+        action = row[2].strip()
+        full_name = row[5].strip() or str(user_id)
+        username = row[6].strip()
+        state = states.setdefault(
+            user_id,
+            {"work": None, "activity": None},
+        )
+
+        if action == BUTTON_CHECKIN:
+            state["work"] = build_work_session_from_row(
+                ALLOWED_GROUP_ID,
+                user_id,
+                full_name,
+                username,
+                record_time,
+            )
+            state["activity"] = None
+
+        elif action == BUTTON_CHECKOUT:
+            state["work"] = None
+            state["activity"] = None
+
+        elif action in ACTIVITY_CONFIG:
+            if state["work"] is not None:
+                state["activity"] = build_activity_session_from_row(
+                    ALLOWED_GROUP_ID,
+                    user_id,
+                    full_name,
+                    username,
+                    action,
+                    record_time,
+                )
+
+        elif action in {
+            config["return_action"]
+            for config in ACTIVITY_CONFIG.values()
+        }:
+            state["activity"] = None
+
+        elif action in {
+            config["alert_action"]
+            for config in ACTIVITY_CONFIG.values()
+        }:
+            if state["activity"] is not None:
+                state["activity"]["alerted"] = True
+
+    work_sessions: dict[tuple[int, int], dict] = {}
+    activity_sessions: dict[tuple[int, int], dict] = {}
+
+    for user_id, state in states.items():
+        work_session = state["work"]
+
+        if work_session is None:
+            continue
+
+        work_age = (
+            now - work_session["started_at"]
+        ).total_seconds()
+
+        if not (
+            0 <= work_age <= MAX_WORK_SESSION_HOURS * 3600
+        ):
+            continue
+
+        session_key = create_session_key(
+            ALLOWED_GROUP_ID,
+            user_id,
+        )
+        work_sessions[session_key] = work_session
+
+        activity_session = state["activity"]
+
+        if activity_session is None:
+            continue
+
+        activity_age = (
+            now - activity_session["started_at"]
+        ).total_seconds()
+
+        if (
+            0 <= activity_age
+            <= MAX_ACTIVITY_SESSION_HOURS * 3600
+        ):
+            activity_sessions[session_key] = activity_session
+
+    return work_sessions, activity_sessions
+
+
+async def restore_active_sessions_from_sheet(
+    application: Application,
+    replace_existing: bool = False,
+) -> None:
+    """Restore active sessions and their timeout jobs from Google Sheets."""
+    rows = await asyncio.to_thread(read_all_sheet_rows)
+    now = datetime.now(TIME_ZONE)
+
+    work_sessions, activity_sessions = reconstruct_active_sessions(
+        rows,
+        now,
+    )
+
+    if replace_existing:
+        ACTIVE_WORK_SESSIONS.clear()
+        ACTIVE_ACTIVITY_SESSIONS.clear()
+
+    for session_key, session in work_sessions.items():
+        ACTIVE_WORK_SESSIONS.setdefault(
+            session_key,
+            session,
+        )
+
+    for session_key, session in activity_sessions.items():
+        if session_key in ACTIVE_ACTIVITY_SESSIONS:
+            continue
+
+        ACTIVE_ACTIVITY_SESSIONS[session_key] = session
+
+        if session.get("alerted"):
+            continue
+
+        try:
+            schedule_timeout_job(
+                application,
+                session,
+            )
+        except Exception:
+            logger.exception(
+                "恢复活动超时任务失败：%s",
+                session_key,
+            )
+
+    logger.info(
+        "状态恢复完成：上班中 %s 人，活动中 %s 人。",
+        len(ACTIVE_WORK_SESSIONS),
+        len(ACTIVE_ACTIVITY_SESSIONS),
+    )
+
+
+async def recover_user_state_if_missing(
+    application: Application,
+    chat_id: int,
+    user_id: int,
+) -> None:
+    """On-demand recovery if a required in-memory state is missing."""
+    # Always re-read the durable Sheet here. The caller invokes this only
+    # when the specific state it needs is absent. A work session may still
+    # exist in memory while its meal/toilet session was lost.
+    try:
+        await restore_active_sessions_from_sheet(
+            application,
+            replace_existing=False,
+        )
+    except Exception:
+        logger.exception(
+            "按需恢复用户状态失败：chat_id=%s user_id=%s",
+            chat_id,
+            user_id,
+        )
+
+
 # =========================================================
 # 工具函数
 # =========================================================
@@ -430,11 +706,11 @@ def get_shift_info(
 ) -> dict:
     current_time = moment.time()
 
-    # 白班：08:00 到 20:00
+    # 07:00–18:59:59: tính là ca ngày 08:00–20:00
     if (
-        DAY_SHIFT_START
+        DAY_CHECKIN_START
         <= current_time
-        < DAY_SHIFT_END
+        < NIGHT_CHECKIN_START
     ):
         shift_date = moment.date()
 
@@ -457,9 +733,11 @@ def get_shift_info(
             "schedule": "08:00-20:00",
         }
 
-    # 夜班：20:00 到第二天08:00
-    if current_time >= NIGHT_SHIFT_START:
+    # 19:00–23:59:59: ca đêm bắt đầu 20:00 cùng ngày
+    if current_time >= NIGHT_CHECKIN_START:
         shift_start_date = moment.date()
+
+    # 00:00–06:59:59: ca đêm bắt đầu 20:00 ngày hôm trước
     else:
         shift_start_date = (
             moment.date()
@@ -529,6 +807,17 @@ async def timeout_warning_job(
     session = ACTIVE_ACTIVITY_SESSIONS.get(
         session_key
     )
+
+    # Render 重启后，内存状态会消失；从 Google Sheets 自动恢复。
+    if session is None:
+        await recover_user_state_if_missing(
+            context.application,
+            chat.id,
+            user.id,
+        )
+        session = ACTIVE_ACTIVITY_SESSIONS.get(
+            session_key
+        )
 
     if session is None:
         return
@@ -611,11 +900,22 @@ def schedule_timeout_job(
             "JobQueue 未启用，请检查 requirements.txt。"
         )
 
+    now = datetime.now(TIME_ZONE)
+    elapsed_seconds = max(
+        0,
+        (now - session["started_at"]).total_seconds(),
+    )
+
+    # New sessions wait for the full limit. Restored overdue sessions warn
+    # almost immediately instead of restarting the timer from zero.
+    remaining_seconds = (
+        session["limit_seconds"] - elapsed_seconds
+    )
+    warning_delay = max(1, remaining_seconds + 1)
+
     job = application.job_queue.run_once(
         callback=timeout_warning_job,
-
-        # 增加1秒，避免显示超时0秒
-        when=session["limit_seconds"] + 1,
+        when=warning_delay,
 
         data={
             "chat_id": session["chat_id"],
@@ -870,6 +1170,14 @@ async def start_activity(
         user.id,
     )
 
+    # Render 重启后，先从 Google Sheets 恢复状态，再判断是否上班。
+    if session_key not in ACTIVE_WORK_SESSIONS:
+        await recover_user_state_if_missing(
+            context.application,
+            chat.id,
+            user.id,
+        )
+
     # 必须先上班
     if session_key not in ACTIVE_WORK_SESSIONS:
         await message.reply_text(
@@ -1036,6 +1344,7 @@ async def start_activity(
 
 async def return_from_activity(
     update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -1342,8 +1651,8 @@ async def show_menu(
     await message.reply_text(
         (
             "✅ 考勤系统已经启动。\n\n"
-            "☀️ 白班：08:00-20:00\n"
-            "🌙 夜班：20:00-08:00\n\n"
+            "☀️ 白班：08:00-20:00（07:00起可打卡）\n"
+            "🌙 夜班：20:00-08:00（19:00起可打卡）\n\n"
             "必须先点击“上班”，"
             "才可以吃饭或去厕所。\n\n"
             "吃饭：30分钟\n"
@@ -1492,7 +1801,8 @@ async def handle_button(
 
     elif text == BUTTON_RETURN:
         await return_from_activity(
-            update
+            update,
+            context,
         )
 
     elif text == BUTTON_CHECK:
@@ -1548,6 +1858,11 @@ async def post_init(
         logger.info(
             "Google Sheets 连接成功：%s",
             worksheet.title,
+        )
+
+        await restore_active_sessions_from_sheet(
+            application,
+            replace_existing=True,
         )
 
     except Exception:
